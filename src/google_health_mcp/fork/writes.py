@@ -90,6 +90,13 @@ def positive(value, what: str, most: float | None = None) -> float:
     return value
 
 
+def estimate(value, what: str) -> float:
+    """A nutrient estimate: zero is a real answer (broth has no fat)."""
+    if not config.is_number(value) or value < 0:
+        raise WriteInputError(f"{what} must be a number of 0 or more.")
+    return value
+
+
 def account_zone():
     """The account's time zone from its settings, else its UTC offset, else this host's."""
     settings = api.get_settings()
@@ -181,22 +188,38 @@ def _post(path: str, body: dict, operation: str) -> dict:
         raise api.HealthNetworkError(
             "Network error. Check your connection; the write may have been saved."
         ) from e
+    # Google documents a finished operation, `done: true` with a `response`.
+    # Anything else after a 2xx may still mean the write happened, so say so.
+    odd = (
+        f"Google answered the {operation} in an unexpected form; it may have been "
+        "saved, so check before trying it again."
+    )
     try:
         answer = json.loads(raw)
     except (ValueError, RecursionError) as e:
-        raise api.HealthAPIError(f"Google returned an unreadable response for {operation}.") from e
-    if not isinstance(answer, dict) or answer.get("error"):
+        raise api.HealthAPIError(odd) from e
+    if not isinstance(answer, dict):
+        raise api.HealthAPIError(odd)
+    if answer.get("error"):
         raise api.HealthAPIError(f"Google did not complete the {operation}.")
-    return answer
+    if answer.get("done") is not True:
+        raise api.HealthAPIError(
+            f"Google accepted the {operation} but has not finished it, so it may "
+            "still take effect; check before trying it again."
+        )
+    response = answer.get("response")
+    if not isinstance(response, dict):
+        raise api.HealthAPIError(odd)
+    return response
 
 
 def create(data_type: str, payload: dict) -> str | None:
     """Create one data point; its id (never the resource name, which holds the user id)."""
     field, _ = WRITERS[data_type]
-    answer = _post(
+    response = _post(
         f"users/me/dataTypes/{data_type}/dataPoints", {field: payload}, f"{data_type} create"
     )
-    name = (answer.get("response") or {}).get("name")
+    name = response.get("name")
     point = name.rsplit("/", 1)[-1] if isinstance(name, str) else None
     return point if point and _POINT_ID.fullmatch(point) else None
 

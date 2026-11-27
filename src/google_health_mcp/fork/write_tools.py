@@ -72,9 +72,9 @@ async def health_log_food(
         ):
             if value is not None:
                 unit = "kcal" if key == "energy" else "grams"
-                body[key] = {unit: writes.positive(value, what)}
+                body[key] = {unit: writes.estimate(value, what)}
         if protein_g is not None:
-            grams = writes.positive(protein_g, "protein_g")
+            grams = writes.estimate(protein_g, "protein_g")
             body["nutrients"] = [{"nutrient": "PROTEIN", "quantity": {"grams": grams}}]
         return body, at, at
 
