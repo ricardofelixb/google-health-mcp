@@ -14,6 +14,7 @@ import re
 import sqlite3
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -212,21 +213,25 @@ def delete(data_type: str, point: str) -> bool:
             f"Cannot delete that. data_type is one of: {', '.join(WRITERS)}, and "
             "data_point_id is the id a log tool on this server returned for it."
         )
+    # Which of the night's columns Google wrote, read before the session goes.
+    before = _google_night(days[1]) if data_type == "sleep" else None
     _post(
         f"users/me/dataTypes/{data_type}/dataPoints:batchDelete",
         {"names": [f"users/me/dataTypes/{data_type}/dataPoints/{point}"]},
         f"{data_type} batchDelete",
     )
-    return _best_effort(_after_delete, data_type, point, *days)
+    return _best_effort(_after_delete, data_type, point, *days, before)
 
 
-def log(data_type: str, payload: dict, first: date, last: date) -> tuple[str | None, bool]:
+def log(data_type: str, payload: dict, first: date, last: date) -> tuple[str | None, bool, bool]:
     """Create a point, record it as this server's, refresh its days' cache.
 
-    The ledger is proven writable before anything is sent: a point created
-    while it cannot be recorded could never be deleted here. After the create
-    everything is best-effort, as the point exists whatever happens and its id
-    must still reach the caller, or a retry logs it twice.
+    Returns the id, whether it was recorded, so delete will take it, and
+    whether the cache was refreshed. The ledger is proven writable before
+    anything is sent: a point created while it cannot be recorded could never
+    be deleted here. After the create everything is best-effort, as the point
+    exists whatever happens and its id must still reach the caller, or a retry
+    logs it twice.
     """
     try:
         conn = _open()
@@ -241,7 +246,8 @@ def log(data_type: str, payload: dict, first: date, last: date) -> tuple[str | N
             logger.debug("the ledger is not writable: %s", type(e).__name__)
             raise WriteInputError(_UNRECORDABLE) from None
         point = create(data_type, payload)
-        return point, _best_effort_on(conn, _after_create, data_type, point, first, last)
+        recorded = _best_effort_on(conn, _record, data_type, point, first, last)
+        return point, recorded, _best_effort_on(conn, _after_create, data_type, point, first, last)
     finally:
         conn.close()
 
@@ -289,13 +295,18 @@ def _best_effort_on(conn, step, *args) -> bool:
         return False
 
 
+def _record(conn, data_type, point, first, last) -> bool:
+    if not point:
+        return False
+    conn.execute(
+        "INSERT OR REPLACE INTO fork_written_points VALUES (?, ?, ?, ?)",
+        (data_type, point, first.isoformat(), last.isoformat()),
+    )
+    conn.commit()
+    return True
+
+
 def _after_create(conn, data_type, point, first, last) -> bool:
-    if point:
-        conn.execute(
-            "INSERT OR REPLACE INTO fork_written_points VALUES (?, ?, ?, ?)",
-            (data_type, point, first.isoformat(), last.isoformat()),
-        )
-        conn.commit()
     if not _refresh(conn, data_type, first, last):
         return False
     if data_type == "exercise":
@@ -315,21 +326,17 @@ def _store_workout(conn, point, first, last) -> bool:
     query = "SELECT log_id FROM exercises WHERE date BETWEEN ? AND ?"
     if not point or _holds(conn, query, point, first, last):
         return bool(point)
-    scratch = db.get_db(":memory:")
-    try:
-        google_sync.GOOGLE_SYNC_HANDLERS["exercises"](scratch, first, last)
+    with _scratch("exercises", first, last) as scratch:
         for name in _names(scratch, query, point, first, last):
             row = dict(
                 scratch.execute("SELECT * FROM exercises WHERE log_id = ?", (name,)).fetchone()
             )
             db.save_exercise(conn, row.pop("log_id"), row)
-    finally:
-        scratch.close()
     conn.commit()
     return _holds(conn, query, point, first, last)
 
 
-def _after_delete(conn, data_type, point, first, last) -> bool:
+def _after_delete(conn, data_type, point, first, last, before) -> bool:
     if data_type != "sleep":
         return _refresh(conn, data_type, first, last)
     # The sleep syncs only upsert, so a deleted session's rows stay unless
@@ -339,34 +346,50 @@ def _after_delete(conn, data_type, point, first, last) -> bool:
     query = "SELECT session_id FROM sleep_sessions WHERE date BETWEEN ? AND ?"
     gone = [{"session_id": n} for n in _names(conn, query, point, last, last)]
     db.remove_rows(conn, "sleep_sessions", gone)
-    written = conn.execute(
-        "SELECT 1 FROM sleep WHERE date = ? AND provider = ?", (night, google_sync.PROVIDER)
-    ).fetchone()
-    if written:
-        # Only the columns Google writes are withdrawn: an upsert leaves the
-        # rest, so the night can hold an imported efficiency beside them.
-        db.save_sleep(conn, {"date": night, **dict.fromkeys(_GOOGLE_SLEEP_COLUMNS)})
+    # A Google upsert leaves the columns it does not write, and `provider`
+    # names only the last writer, so a column is Google's only where it holds
+    # what Google's answer gave it: an imported figure beside it stays.
+    row = conn.execute("SELECT * FROM sleep WHERE date = ?", (night,)).fetchone()
+    google = [k for k, v in (before or {}).items() if row is not None and row[k] == v]
+    if google:
+        db.save_sleep(conn, {"date": night, **dict.fromkeys(google)})
     refreshed = _refresh(conn, data_type, first, last)
     row = conn.execute("SELECT * FROM sleep WHERE date = ?", (night,)).fetchone()
-    if written and all(row[k] is None for k in row.keys() if k not in ("date", "provider")):
+    if google and all(row[k] is None for k in row.keys() if k not in ("date", "provider")):
         # A night left with no value at all is removed, as upstream's sweeps do.
         db.remove_rows(conn, "sleep", [{"date": night}])
         conn.commit()
-    return refreshed
+    return refreshed and before is not None
 
 
-#: What upstream's nightly sleep sync writes: its sums, their span and count.
-_GOOGLE_SLEEP_COLUMNS = (
-    "total_minutes",
-    "sleep_period_minutes",
-    "deep_minutes",
-    "light_minutes",
-    "rem_minutes",
-    "wake_minutes",
-    "start_time",
-    "end_time",
-    "sessions",
-)
+def _google_night(night: date) -> dict | None:
+    """The night's values as upstream's sleep sync builds them from Google's answer.
+
+    Read into a scratch cache, so nothing stored colours it. None when it
+    cannot be read: the delete goes ahead, and no column is withdrawn.
+    """
+    try:
+        with _scratch("sleep", night, night) as scratch:
+            row = scratch.execute(
+                "SELECT * FROM sleep WHERE date = ?", (night.isoformat(),)
+            ).fetchone()
+    except Exception as e:  # noqa: BLE001 - only the cache is at stake
+        logger.debug("could not read the night before a delete: %s", type(e).__name__)
+        return None
+    if row is None:
+        return {}
+    return {k: row[k] for k in row.keys() if k not in ("date", "provider") and row[k] is not None}
+
+
+@contextmanager
+def _scratch(table, first, last):
+    """An empty in-memory cache, synced for these days by upstream's handler."""
+    scratch = db.get_db(":memory:")
+    try:
+        google_sync.GOOGLE_SYNC_HANDLERS[table](scratch, first, last)
+        yield scratch
+    finally:
+        scratch.close()
 
 
 def _refresh(conn, data_type, first, last) -> bool:

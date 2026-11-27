@@ -12,19 +12,28 @@ from ..helpers import format_response, require_auth
 from ..mcp_instance import mcp
 from . import writes
 
+_UNRECORDED = (
+    "Logged, but this server could not record it as its own, so health_delete_logged "
+    "will refuse it. To undo it, delete it in the Fitbit app."
+)
+
 
 async def _log(data_type: str, build) -> str:
     """Build in the account's zone, create, then refresh the cache for those days."""
 
     def _run():
         payload, first, last = build(writes.account_zone())
-        point, refreshed = writes.log(data_type, payload, first.date(), last.date())
-        return {
+        point, recorded, refreshed = writes.log(data_type, payload, first.date(), last.date())
+        out = {
             "logged": data_type,
             "data_point_id": point,
             "local_time": first.isoformat(),
             "cache_refreshed": refreshed,
+            "deletable_here": recorded,
         }
+        if not recorded:
+            out["note"] = _UNRECORDED
+        return out
 
     return format_response(await anyio.to_thread.run_sync(_run))
 
