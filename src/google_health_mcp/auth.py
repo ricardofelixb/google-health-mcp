@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 from . import config
 from .errors import GoogleHealthError
+from .fork.scopes import requested_scopes  # fork: docs/fork.md
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +175,7 @@ def _google_auth_url(challenge: str, client_id: str) -> str:
                 "client_id": client_id,
                 "response_type": "code",
                 "redirect_uri": config.GOOGLE_REDIRECT_URI,
-                "scope": config.GOOGLE_SCOPES,
+                "scope": requested_scopes(),  # fork: adds writeonly scopes when on
                 "code_challenge": challenge,
                 "code_challenge_method": "S256",
                 "access_type": "offline",

@@ -29,6 +29,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from . import config, db
+from .fork.scopes import check_write_authorisation  # fork: docs/fork.md
 
 OK = "ok"
 WARN = "warn"
@@ -1092,6 +1093,7 @@ def run_checks() -> list[Finding]:
         check_environment,
         check_credentials,
         check_authorisation,
+        check_write_authorisation,  # fork: docs/fork.md
         check_database,
         check_sync_health,
         check_auth_prerequisites,

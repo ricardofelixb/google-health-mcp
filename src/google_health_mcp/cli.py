@@ -45,6 +45,11 @@ from .tools import (  # noqa: E402
     weight_tools,  # noqa: E402, F401
 )
 
+# isort: split
+# Fork (docs/fork.md): registers the write tools only when on. Imported last, so
+# upstream's tools keep their registration order.
+from .fork import write_tools  # noqa: E402, F401
+
 
 def _version_text():
     return f"google-health-mcp {version('google-health-mcp')}"

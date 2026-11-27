@@ -25,6 +25,15 @@ OFFLINE_MODE = (
     os.environ.get("GOOGLE_HEALTH_MCP_OFFLINE", "").strip().lower() in OFFLINE_TRUTHY_VALUES
 )
 
+
+def write_mode_from(value: str | None) -> bool:
+    """Fork (docs/fork.md): whether GOOGLE_HEALTH_MCP_WRITE turns the write tools on."""
+    return (value or "").strip().lower() in OFFLINE_TRUTHY_VALUES
+
+
+# Fork (docs/fork.md): opt-in write tools; off leaves upstream behaviour unchanged.
+WRITE_MODE = write_mode_from(os.environ.get("GOOGLE_HEALTH_MCP_WRITE"))
+
 # Google Health API. The client file is Google's downloaded Desktop-client
 # JSON, read as-is rather than reshaped, so a user can drop it in unedited.
 GOOGLE_CLIENT_PATH = CONFIG_DIR / "google_client.json"

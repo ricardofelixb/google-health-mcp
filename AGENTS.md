@@ -63,6 +63,7 @@ The rest of the guide is in `docs/agents/`, one file per area. Most of each file
 | `tools/google_sync.py` | [sync.md](docs/agents/sync.md), [schema.md](docs/agents/schema.md), [auth.md](docs/agents/auth.md) |
 | `tools/sync_tools.py` | [sync.md](docs/agents/sync.md), [tools.md](docs/agents/tools.md), [auth.md](docs/agents/auth.md), [schema.md](docs/agents/schema.md) |
 | Every other `tools/*_tools.py` | [tools.md](docs/agents/tools.md), [schema.md](docs/agents/schema.md) |
+| Fork code, `fork/*.py` | [docs/fork.md](docs/fork.md), [auth.md](docs/agents/auth.md), [sync.md](docs/agents/sync.md), [tools.md](docs/agents/tools.md) |
 | A table or column in `SCHEMA` | [schema.md](docs/agents/schema.md), [sync.md](docs/agents/sync.md) |
 | `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `pyproject.toml`, `uv.lock` | [seams.md](docs/agents/seams.md), [doctor.md](docs/agents/doctor.md), [sync.md](docs/agents/sync.md), [tools.md](docs/agents/tools.md) |
 
