@@ -267,109 +267,91 @@ class TestDelete:
             asyncio.run(write_tools.health_delete_logged(data_type=data_type, data_point_id=point))
         assert google.writes == []
 
-    def test_deleting_sleep_clears_the_cached_session_and_night(self, google):
+    def test_deleting_sleep_clears_the_cached_session_and_night(self, google, monkeypatch):
+        _google_sleep(monkeypatch, google, _session(_POINT.format("sleep"), 480))
         _call(write_tools.health_log_sleep, start="2026-03-10T23:00", end="2026-03-11T07:00")
-        name = _POINT.format("sleep")
-        conn = db.get_db()
-        db.save_sleep_session(
-            conn, {"session_id": name, "date": "2026-03-11", "record": "{}", "provider": "google"}
-        )
-        db.save_sleep_session(
-            conn,
-            {"session_id": name + "0", "date": "2026-03-11", "record": "{}", "provider": "google"},
-        )
-        db.save_sleep(conn, {"date": "2026-03-11", "total_minutes": 480, "provider": "google"})
-        conn.commit(), conn.close()
-        # The re-sync finds no session left, so it writes nothing: the sleep
-        # sync only upserts, and would leave both rows behind on its own.
+        assert _night()["total_minutes"] == 480
         _call(
             write_tools.health_delete_logged, data_type="sleep", data_point_id="fictional-point-7"
         )
         conn = db.get_db()
-        sessions = [r[0] for r in conn.execute("SELECT session_id FROM sleep_sessions")]
-        nights = conn.execute("SELECT COUNT(*) FROM sleep").fetchone()[0]
+        sessions = conn.execute("SELECT COUNT(*) FROM sleep_sessions").fetchone()[0]
         conn.close()
-        assert sessions == [name + "0"] and nights == 0
-        assert google.types[-2:] == ["sleep", "sleep_sessions"]
+        # The sleep syncs only upsert, and would leave both rows behind on their own.
+        assert sessions == 0 and _night() is None
 
-    def test_deleting_sleep_keeps_what_an_import_recorded_for_the_night(self, google):
-        """A Google upsert leaves the columns it never writes, so a night can
-        hold an imported efficiency beside Google's sums: only the sums go."""
-        _call(write_tools.health_log_sleep, start="2026-03-10T23:00", end="2026-03-11T07:00")
+    def test_deleting_sleep_keeps_what_an_import_recorded_for_the_night(self, google, monkeypatch):
+        """A Google upsert leaves the columns it does not write this time, so a
+        night can hold an imported figure beside Google's: only Google's go."""
         conn = db.get_db()
         db.save_sleep(
             conn,
-            {
-                "date": "2026-03-11",
-                "total_minutes": 480,
-                "deep_minutes": 90,
-                "efficiency": 91,
-                "sessions": 1,
-                "provider": "google",
-            },
+            {"date": "2026-03-11", "deep_minutes": 75, "efficiency": 91, "provider": "fitbit"},
         )
         conn.commit(), conn.close()
-        _call(
+        _google_sleep(monkeypatch, google, _session(_POINT.format("sleep"), 480))
+        _call(write_tools.health_log_sleep, start="2026-03-10T23:00", end="2026-03-11T07:00")
+        assert _night()["provider"] == "google"
+        out = _call(
             write_tools.health_delete_logged, data_type="sleep", data_point_id="fictional-point-7"
         )
-        conn = db.get_db()
-        night = dict(conn.execute("SELECT * FROM sleep").fetchone())
-        conn.close()
-        assert night["efficiency"] == 91
-        assert night["total_minutes"] is night["deep_minutes"] is night["sessions"] is None
+        night = _night()
+        assert out["cache_refreshed"] is True
+        assert (night["deep_minutes"], night["efficiency"]) == (75, 91)
+        assert night["total_minutes"] is night["sessions"] is night["start_time"] is None
 
     def test_deleting_one_sleep_session_rebuilds_the_night_from_the_rest(self, google, monkeypatch):
-        _call(write_tools.health_log_sleep, start="2026-03-11T13:00", end="2026-03-11T14:00")
         conn = db.get_db()
-        db.save_sleep(
-            conn,
-            {
-                "date": "2026-03-11",
-                "total_minutes": 540,
-                "deep_minutes": 90,
-                "efficiency": 91,
-                "sessions": 2,
-                "provider": "google",
-            },
-        )
+        db.save_sleep(conn, {"date": "2026-03-11", "efficiency": 91, "provider": "fitbit"})
         conn.commit(), conn.close()
-        left = {
-            "name": _POINT.format("sleep") + "0",
-            "sleep": {
-                "interval": {"endTime": "2026-03-11T11:00:00Z", "endUtcOffset": "-14400s"},
-                "summary": {"minutesAsleep": 480},
-            },
-        }
-        monkeypatch.setattr(api, "list_google_data_points", lambda *a, **k: [left])
-        monkeypatch.setitem(google_sync.GOOGLE_SYNC_HANDLERS, "sleep", google_sync.sync_sleep)
+        ours = _session(_POINT.format("sleep"), 60, deep=45)
+        _google_sleep(monkeypatch, google, ours, _session(_POINT.format("sleep") + "0", 480))
+        _call(write_tools.health_log_sleep, start="2026-03-11T13:00", end="2026-03-11T14:00")
+        assert (_night()["total_minutes"], _night()["deep_minutes"]) == (540, 45)
         _call(
             write_tools.health_delete_logged, data_type="sleep", data_point_id="fictional-point-7"
         )
-        conn = db.get_db()
-        night = dict(conn.execute("SELECT * FROM sleep").fetchone())
-        conn.close()
-        assert (night["total_minutes"], night["sessions"]) == (480, 1)
-        assert night["deep_minutes"] is None and night["efficiency"] == 91
+        night = _night()
+        assert (night["total_minutes"], night["sessions"], night["efficiency"]) == (480, 1, 91)
+        assert night["deep_minutes"] is None
 
-    def test_every_column_the_sleep_sync_writes_is_withdrawn_on_delete(self, monkeypatch):
-        stages = [{"type": t, "minutes": 1} for t in google_sync._SLEEP_STAGE_COLUMNS]
-        point = {
-            "sleep": {
-                "interval": {
-                    "startTime": "2026-03-11T03:00:00Z",
-                    "endTime": "2026-03-11T11:00:00Z",
-                    "endUtcOffset": "-14400s",
-                },
-                "summary": {"minutesAsleep": 1, "minutesInSleepPeriod": 1, "stagesSummary": stages},
-            }
-        }
-        monkeypatch.setattr(api, "list_google_data_points", lambda *a, **k: [point])
-        conn = db.get_db()
-        google_sync.sync_sleep(conn, *[datetime(2026, 3, 11).date()] * 2)
-        row = conn.execute("SELECT * FROM sleep").fetchone()
-        conn.close()
-        written = {k for k in row.keys() if row[k] is not None} - {"date", "provider"}
-        assert written == set(writes._GOOGLE_SLEEP_COLUMNS)
+
+def _session(name, minutes, deep=None):
+    """A fictional sleep session ending on the local night of 2026-03-11."""
+    stages = [] if deep is None else [{"type": "DEEP", "minutes": deep}]
+    return {
+        "name": name,
+        "sleep": {
+            "interval": {
+                "startTime": "2026-03-11T03:00:00Z",
+                "startUtcOffset": "-14400s",
+                "endTime": "2026-03-11T11:00:00Z",
+                "endUtcOffset": "-14400s",
+            },
+            "summary": {"minutesAsleep": minutes, "stagesSummary": stages},
+        },
+    }
+
+
+def _google_sleep(monkeypatch, google, *sessions):
+    """Google answers with these sessions, less this server's once its delete is sent."""
+    ours = _POINT.format("sleep")
+
+    def answer(*_a, **_k):
+        deleted = any(url.endswith(":batchDelete") for _, url, _ in google.calls)
+        return [s for s in sessions if not (deleted and s["name"] == ours)]
+
+    monkeypatch.setattr(api, "list_google_data_points", answer)
+    for table in ("sleep", "sleep_sessions"):
+        handler = getattr(google_sync, f"sync_{table}")
+        monkeypatch.setitem(google_sync.GOOGLE_SYNC_HANDLERS, table, handler)
+
+
+def _night():
+    conn = db.get_db()
+    row = conn.execute("SELECT * FROM sleep WHERE date = '2026-03-11'").fetchone()
+    conn.close()
+    return None if row is None else dict(row)
 
 
 class TestTheCacheRefresh:
@@ -393,6 +375,7 @@ class TestTheCacheRefresh:
         monkeypatch.setitem(google_sync.GOOGLE_SYNC_HANDLERS, "weight", failing)
         out = _call(write_tools.health_log_weight, kilograms=70, time=_EVENING)
         assert out["data_point_id"] == "fictional-point-7" and out["cache_refreshed"] is False
+        assert out["deletable_here"] is True and "note" not in out
         monkeypatch.setitem(google_sync.GOOGLE_SYNC_HANDLERS, "weight", working)
         google.calls.clear()
         _call(
@@ -407,6 +390,28 @@ class TestTheCacheRefresh:
         monkeypatch.setitem(google_sync.GOOGLE_SYNC_HANDLERS, "weight_readings", failing)
         out = _call(write_tools.health_log_weight, kilograms=70, time=_EVENING)
         assert out["data_point_id"] == "fictional-point-7" and out["cache_refreshed"] is False
+
+    def test_a_log_it_could_not_record_says_it_cannot_be_deleted_here(self, google, monkeypatch):
+        """The ledger was writable when checked, then failed once the point
+        existed: the id still comes back, with word to delete it in the app."""
+
+        class NoRecord:
+            def __init__(self, conn):
+                self._conn = conn
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+            def execute(self, sql, *args):
+                if sql.startswith("INSERT OR REPLACE INTO fork_written_points"):
+                    raise sqlite3.OperationalError("disk I/O error")
+                return self._conn.execute(sql, *args)
+
+        real = db.get_db
+        monkeypatch.setattr(db, "get_db", lambda *a, **k: NoRecord(real(*a, **k)))
+        out = _call(write_tools.health_log_weight, kilograms=70, time=_EVENING)
+        assert out["data_point_id"] == "fictional-point-7" and len(google.writes) == 1
+        assert out["deletable_here"] is False and "Fitbit app" in out["note"]
 
     def test_refreshes_the_account_day_even_when_the_host_is_a_day_behind(self, google):
         """Tokyo is past midnight while this host is still on the day before."""
