@@ -61,6 +61,10 @@ Writes use their own POST in `fork/writes.py` rather than `api.google_get`, beca
 that one re-sends a request answered 500-503 and a re-sent create logs twice.
 Errors follow AGENTS.md: fixed text, a status code and an operation such as
 `weight create`, never a body or a resource name.
+Google documents every write answer as a finished operation (`done: true` with a
+`response`). A pending operation, or any other shape after a 2xx, is reported as
+an error saying the write may still exist, never as `logged` or `deleted`.
+There is no endpoint to poll an operation, so the caller is told to check first.
 
 **Where.**
 
