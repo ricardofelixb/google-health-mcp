@@ -452,10 +452,11 @@ def _activity_minutes(payload: dict) -> dict | None:
         minutes = _number(entry.get("activeMinutesSum"), int)
         if column is not None and minutes is not None:
             columns[column] = minutes
-    if "fairly_active_minutes" in columns and "very_active_minutes" in columns:
-        columns["active_minutes"] = (
-            columns["fairly_active_minutes"] + columns["very_active_minutes"]
-        )
+    parts = [columns.get(c) for c in ("fairly_active_minutes", "very_active_minutes")]
+    if parts != [None, None]:
+        # A part written alone would leave a stored total that no longer adds
+        # up, so the total is rewritten with its parts, or withdrawn.
+        columns["active_minutes"] = None if None in parts else sum(parts)
     return columns or None
 
 
@@ -475,8 +476,10 @@ def sync_activity(conn, start, end) -> int:
     `lightly_active_minutes`, `fairly_active_minutes` and `very_active_minutes`,
     and `active_minutes` is the moderate plus the vigorous minutes, as the
     column has always been defined. A level the point omits is left unwritten
-    rather than read as zero, as `sync_azm` treats a zone, and so is the total
-    when either of its parts is missing: one part alone would understate it.
+    rather than read as zero, as `sync_azm` treats a zone. The total is
+    written whenever either of its parts is, and withdrawn when only one is:
+    one part alone would understate it, and a stored total beside a rewritten
+    part would no longer add up. A point naming neither leaves it untouched.
 
     `activity-level` is not read for them, though its vocabulary maps onto the
     same columns: its raw list returns more minute-long segments than the day
