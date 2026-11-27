@@ -562,7 +562,7 @@ async def health_sync(
             "exercise_routes", "sleep_sessions", "weight_readings",
             "body_fat_readings", "sedentary_periods", "altitude_gains",
             "swim_lengths", "respiratory_rate_sleep", "food_entries",
-            "water_entries".
+            "water_entries", "heart_rate_intraday".
             Comma-separated for multiple, e.g. "sleep,hrv". Default: "all".
         days: Days of history for first sync (default: 30). Ignored
             on subsequent syncs (uses last synced date).
@@ -576,7 +576,8 @@ async def health_sync(
 
     Returns summary of records synced per data type; for the day-at-a-time
     types (sedentary_periods, altitude_gains, swim_lengths,
-    respiratory_rate_sleep, food_entries, water_entries) the count is of days.
+    respiratory_rate_sleep, food_entries, water_entries, heart_rate_intraday)
+    the count is of days.
     Not for querying data - use health_get_heart_rate, health_get_activity,
     health_get_sleep, etc. instead.
     """
