@@ -452,9 +452,10 @@ def _activity_minutes(payload: dict) -> dict | None:
         minutes = _number(entry.get("activeMinutesSum"), int)
         if column is not None and minutes is not None:
             columns[column] = minutes
-    active = [columns[c] for c in ("fairly_active_minutes", "very_active_minutes") if c in columns]
-    if active:
-        columns["active_minutes"] = sum(active)
+    if "fairly_active_minutes" in columns and "very_active_minutes" in columns:
+        columns["active_minutes"] = (
+            columns["fairly_active_minutes"] + columns["very_active_minutes"]
+        )
     return columns or None
 
 
@@ -472,9 +473,10 @@ def sync_activity(conn, start, end) -> int:
     The activity minutes come from `active-minutes`, Google's daily rollup of
     time at each activity level: LIGHT, MODERATE and VIGOROUS fill
     `lightly_active_minutes`, `fairly_active_minutes` and `very_active_minutes`,
-    and `active_minutes` is the moderate and vigorous minutes present, as the
+    and `active_minutes` is the moderate plus the vigorous minutes, as the
     column has always been defined. A level the point omits is left unwritten
-    rather than read as zero, as `sync_azm` treats a zone.
+    rather than read as zero, as `sync_azm` treats a zone, and so is the total
+    when either of its parts is missing: one part alone would understate it.
 
     `activity-level` is not read for them, though its vocabulary maps onto the
     same columns: its raw list returns more minute-long segments than the day

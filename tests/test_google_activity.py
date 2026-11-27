@@ -209,7 +209,26 @@ class TestTheMinuteColumns:
         assert row["very_active_minutes"] == 12
         assert row["fairly_active_minutes"] is None
         assert row["lightly_active_minutes"] is None
-        assert row["active_minutes"] == 12
+        # The total needs both of its parts; one alone would understate it.
+        assert row["active_minutes"] is None
+
+    def test_a_partial_point_leaves_a_stored_total_alone(self, tmp_db, sync_activity):
+        """Vigorous alone beside a stored moderate figure is not written as the total."""
+        db.save_activity(
+            tmp_db,
+            {
+                "date": "2026-03-15",
+                "fairly_active_minutes": 25,
+                "very_active_minutes": 15,
+                "active_minutes": 40,
+            },
+        )
+        tmp_db.commit()
+        sync_activity(rollups={"active-minutes": [_minutes(("VIGOROUS", 12))]})
+        row = db.query_activity(tmp_db, "2026-03-15", "2026-03-15")[0]
+        assert row["fairly_active_minutes"] == 25
+        assert row["very_active_minutes"] == 12
+        assert row["active_minutes"] == 40
 
     def test_light_alone_names_no_active_total(self, tmp_db, sync_activity):
         """`active_minutes` excludes light activity, so light alone says nothing of it."""
