@@ -292,15 +292,59 @@ class TestDelete:
         assert sessions == [name + "0"] and nights == 0
         assert google.types[-2:] == ["sleep", "sleep_sessions"]
 
+    def test_deleting_sleep_keeps_what_an_import_recorded_for_the_night(self, google):
+        """A Google upsert leaves the columns it never writes, so a night can
+        hold an imported efficiency beside Google's sums: only the sums go."""
+        _call(write_tools.health_log_sleep, start="2026-03-10T23:00", end="2026-03-11T07:00")
+        conn = db.get_db()
+        db.save_sleep(
+            conn,
+            {
+                "date": "2026-03-11",
+                "total_minutes": 480,
+                "deep_minutes": 90,
+                "efficiency": 91,
+                "sessions": 1,
+                "provider": "google",
+            },
+        )
+        conn.commit(), conn.close()
+        _call(
+            write_tools.health_delete_logged, data_type="sleep", data_point_id="fictional-point-7"
+        )
+        conn = db.get_db()
+        night = dict(conn.execute("SELECT * FROM sleep").fetchone())
+        conn.close()
+        assert night["efficiency"] == 91
+        assert night["total_minutes"] is night["deep_minutes"] is night["sessions"] is None
+
 
 class TestTheCacheRefresh:
-    def test_a_cache_failure_still_returns_the_created_id(self, google, monkeypatch):
+    def test_refuses_to_log_what_it_could_not_record_as_its_own(self, google, monkeypatch):
+        """A point created while the ledger is out of reach could never be
+        deleted here, so nothing is sent until it is known to be writable."""
+
         def broken(*_a, **_k):
             raise sqlite3.OperationalError("disk I/O error")
 
         monkeypatch.setattr(db, "get_db", broken)
+        with pytest.raises(writes.WriteInputError, match="nothing was logged"):
+            asyncio.run(write_tools.health_log_weight(kilograms=70, time=_EVENING))
+        assert google.writes == []
+
+    def test_a_logged_point_stays_deletable_when_its_refresh_fails(self, google, monkeypatch):
+        def failing(conn, start, end):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        working = google_sync.GOOGLE_SYNC_HANDLERS["weight"]
+        monkeypatch.setitem(google_sync.GOOGLE_SYNC_HANDLERS, "weight", failing)
         out = _call(write_tools.health_log_weight, kilograms=70, time=_EVENING)
         assert out["data_point_id"] == "fictional-point-7" and out["cache_refreshed"] is False
+        monkeypatch.setitem(google_sync.GOOGLE_SYNC_HANDLERS, "weight", working)
+        google.calls.clear()
+        _call(
+            write_tools.health_delete_logged, data_type="weight", data_point_id="fictional-point-7"
+        )
         assert len(google.writes) == 1
 
     def test_a_failing_sync_still_returns_the_created_id(self, google, monkeypatch):
@@ -318,12 +362,10 @@ class TestTheCacheRefresh:
         _call(write_tools.health_log_weight, kilograms=70, time=f"{tomorrow}T00:30")
         assert google.synced[-1] == ("weight_readings", str(tomorrow), str(tomorrow))
 
-    def test_a_workout_the_read_tools_will_not_show_is_not_called_refreshed(
-        self, google, monkeypatch
-    ):
-        """Upstream leaves a day an import recorded to the import, so a Google
-        workout that day never reaches the cache. Saying it was refreshed
-        would send the agent looking for a workout the read tools hide."""
+    def test_a_workout_on_a_day_an_import_recorded_is_cached_beside_it(self, google, monkeypatch):
+        """Upstream leaves a day an import recorded to the import, to keep a
+        workout both sources hold from being stored twice. A workout this
+        server just logged is in no import, so it is stored all the same."""
         conn = db.get_db()
         conn.execute(
             "INSERT INTO exercises (log_id, date) VALUES ('fictional-import-1', '2026-03-10')"
@@ -332,15 +374,28 @@ class TestTheCacheRefresh:
         workout = {
             "name": _POINT.format("exercise"),
             "exercise": {
-                "interval": {"startTime": "2026-03-10T11:00:00Z", "startUtcOffset": "-14400s"}
+                "interval": {"startTime": "2026-03-10T11:00:00Z", "startUtcOffset": "-14400s"},
+                "exerciseType": "RUNNING",
             },
         }
-        monkeypatch.setattr(api, "list_google_data_points", lambda *a, **k: [workout])
+        other = {**workout, "name": _POINT.format("exercise") + "0"}
+        monkeypatch.setattr(api, "list_google_data_points", lambda *a, **k: [workout, other])
         monkeypatch.setitem(
             google_sync.GOOGLE_SYNC_HANDLERS, "exercises", google_sync.sync_exercises
         )
         args = {"exercise_type": "running", "start": "2026-03-10T07:00", "end": "2026-03-10T07:30"}
-        assert _call(write_tools.health_log_exercise, **args)["cache_refreshed"] is False
+        assert _call(write_tools.health_log_exercise, **args)["cache_refreshed"] is True
+
+        conn = db.get_db()
+        # A later sync of the day leaves it, as Google still holds it.
+        google_sync.sync_exercises(conn, *[datetime(2026, 3, 10).date()] * 2)
+        rows = conn.execute("SELECT log_id, provider FROM exercises ORDER BY log_id").fetchall()
+        conn.close()
+        # Only the logged workout: the day's other Google workout stays the import's.
+        assert [tuple(r) for r in rows] == [
+            ("fictional-import-1", None),
+            (_POINT.format("exercise"), "google"),
+        ]
 
     def test_a_workout_the_sync_stored_is_called_refreshed(self, google, monkeypatch):
         def store(conn, start, end):
