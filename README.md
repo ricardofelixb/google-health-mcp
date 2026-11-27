@@ -27,7 +27,8 @@ Designed for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and o
 |------|------|
 | `health_get_heart_rate` | Resting heart rate |
 | `health_get_heart_rate_zones` | Google's daily heart-rate zone boundaries |
-| `health_get_activity` | Steps, calories, distance, floors |
+| `health_get_heart_rate_intraday` | Heart rate through a night or a day: min, average and max per 5 to 60 minutes, and when it peaked |
+| `health_get_activity` | Steps, calories, distance, floors, active minutes by intensity |
 | `health_get_activity_events` | Each sedentary period, altitude gain and swim length: its start, end and values |
 | `health_get_exercises` | Workouts: name, duration, heart rate, calories, Google's metrics summary, and splits on request |
 | `health_get_exercise_route` | One workout's GPS route, as the TCX file Google exports |
@@ -179,7 +180,7 @@ google-health-mcp sync           Sync data to the local cache
                         account, height, exercise_routes, sleep_sessions,
                         weight_readings, body_fat_readings, sedentary_periods,
                         altitude_gains, swim_lengths, respiratory_rate_sleep,
-                        food_entries, water_entries
+                        food_entries, water_entries, heart_rate_intraday
   --since YYYY-MM-DD    Fetch from this date, ignoring the incremental cursor
   --until YYYY-MM-DD    Inclusive end date for a --since window; together they
                         re-fetch exactly that window, to repair a gap in the
@@ -197,7 +198,7 @@ google-health-mcp import         Import exported JSON data files
 
 Query tools sync on the first query of each day per data type, then read the cache. Types a tool reads together sync together when any of them is due.
 
-All query tools except `health_get_devices`, `health_get_lifetime_stats`, `health_get_profile` and `health_get_exercise_route` accept:
+All query tools except `health_get_devices`, `health_get_lifetime_stats`, `health_get_profile`, `health_get_exercise_route` and `health_get_heart_rate_intraday` accept:
 
 - `start_date` - `YYYY-MM-DD`, `YYYY-MM`, or `30d` (relative). Default: 30 days back from the end date or today, whichever is earlier. `health_get_height` goes back ten years instead. `health_get_activity_events` goes back 7 days, and so does `health_get_food_log` with `include_entries`.
 - `end_date` - `YYYY-MM-DD`, `YYYY-MM` (its last day), or `30d`. Default: today.
@@ -215,6 +216,8 @@ A start after the end, or a date of the right shape that does not exist, such as
 
 `health_get_activity_events` defaults to the last 7 days rather than 30, since a day can hold dozens of sedentary periods. It returns each event's start, end and values; `include_records` returns each one exactly as Google sent it instead.
 
+`health_get_heart_rate_intraday` shows when during a night or a day your heart rate was high, such as after a late dinner or an afternoon workout. It takes `start` and `end` rather than dates: each is a date (`2026-03-15`, its midnight), a local time (`2026-03-15T22:30`) or a time with a UTC offset. Without them it covers the latest night's sleep in the cache (its longest session, so an afternoon nap does not stretch it; the sessions are synced first if stale), or today if there is none; `end` defaults to a day after `start`, and a window is at most 7 days. `resolution_minutes` is 5, 10, 15, 30 or 60 (default 15), and buckets start on the local clock; a window that cuts a bucket is widened to the whole bucket, and the reply's `start` and `end` say where it fell. Times carry their UTC offset (`2026-03-15T22:30+01:00`), so the hour repeated when the clocks go back shows as two hours, and a bucket a clock change falls inside is cut at the change. Each bucket carries the lowest, average and highest heart rate, and the summary says which bucket held the peak. A bucket you were not wearing the device in is left out. The cache holds Google's five-minute rollup of your heart rate, a day at a time, rather than the per-second readings, and `live` re-fetches the days the window touches.
+
 `health_get_exercise_route` takes a workout's `log_id`. The route text comes back only with `include_tcx`, since it can run to hundreds of kilobytes. Only workouts recorded with GPS have a route, and a sync fetches routes for the workouts in its own window, so an older one needs `health_sync` with `data_types="exercise_routes"` and `since`. A route holds every position you recorded, start and end included: it is cached on disk like the rest, and reaches the model only when `include_tcx` is set.
 
 **If your authorisation lacks a permission this version reads**, every successful tool response carries an `authorisation` note naming it, `doctor` reports it under the check `missing-scopes`, and `sync` prints it. The data types read under it are skipped rather than failed, so `sync` still exits 0. A grant does not gain permissions on refresh, so this is what an upgrade that adds one looks like until you run `google-health-mcp auth` again. `doctor` on the syncing host sees the new grant straight away; the tool note, and `doctor` on a cache-only host, catch up once the next sync has run. Run `google-health-mcp sync` after authorising to fetch the newly granted data at once; a query tool otherwise waits for the next day, since a skipped type counts as synced for that day.
@@ -227,7 +230,7 @@ A start after the end, or a date of the right shape that does not exist, such as
 
 **What you delete or change in the app is deleted or changed in the cache.** That covers food, drink, body temperature, weigh-ins, body fat and workouts, whether you logged a workout or the watch recorded it. An entry deleted in the app simply stops appearing in the API, with nothing to say it was deleted. So once a sync has Google's whole answer for its dates, it removes what Google no longer holds for those dates. It never touches imported history or dates outside the sync. If Google's answer holds something the sync cannot place, it removes nothing that run. An ordinary sync covers only the last few days, so for a deletion further back, or an entry moved to an earlier date, run `health_rebuild` or `sync --since` over those dates.
 
-A device series is not deleted after the fact, so a sync never removes from it. Sedentary periods, altitude gains, swim lengths and the sleep-stage breathing summaries are kept a day at a time. A re-sync replaces each such day with what Google sends for it now. A day Google sends nothing for keeps what it had.
+A device series is not deleted after the fact, so a sync never removes from it. Sedentary periods, altitude gains, swim lengths, the sleep-stage breathing summaries and heart rate through the day are kept a day at a time. A re-sync replaces each such day with what Google sends for it now. A day Google sends nothing for keeps what it had.
 
 ### health_rebuild
 

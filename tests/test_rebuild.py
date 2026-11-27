@@ -7,6 +7,7 @@ went and what changed, and without `apply` the work runs on a copy, so
 nothing in the cache moves: a person or a model reads the list and decides.
 """
 
+import contextlib
 import json
 from datetime import date, timedelta
 from unittest.mock import patch
@@ -170,8 +171,9 @@ def test_a_reading_on_the_first_day_that_google_files_under_the_day_before_is_ke
     def listed(data_type, start, end, view="list"):
         return [later] + ([reading] if start <= date(2026, 3, 9) < end else [])
 
-    first, second, third, fourth, fifth = _sync_answers()
-    with first, second, third, fourth, fifth:
+    with contextlib.ExitStack() as stack:
+        for answer in _sync_answers():
+            stack.enter_context(answer)
         with patch.object(google_sync.api, "list_google_data_points", side_effect=listed):
             report = sync_tools.rebuild(["ecg"], "2026-03-10", "2026-03-16", apply=True)
     assert report["types"]["ecg"]["removed"] == []
@@ -270,6 +272,7 @@ def _sync_answers(lists=None, rollups=None):
     return (
         patch.object(google_sync.api, "list_google_data_points", side_effect=listed),
         patch.object(google_sync.api, "daily_roll_up", side_effect=rolled),
+        patch.object(google_sync.api, "roll_up", return_value=[]),
         patch.object(sync_tools.auth, "granted_scopes", return_value=None),
         patch.object(sync_tools.auth, "refresh_google_token"),
         patch.object(sync_tools.config, "OFFLINE_MODE", False),
@@ -277,8 +280,9 @@ def _sync_answers(lists=None, rollups=None):
 
 
 def _rebuild_with(types, apply=True, lists=None, rollups=None):
-    first, second, third, fourth, fifth = _sync_answers(lists, rollups)
-    with first, second, third, fourth, fifth:
+    with contextlib.ExitStack() as stack:
+        for answer in _sync_answers(lists, rollups):
+            stack.enter_context(answer)
         return sync_tools.rebuild(list(types), "2026-03-10", "2026-03-16", apply=apply)
 
 
@@ -441,8 +445,9 @@ def test_the_tables_left_to_their_sync_are_the_ones_it_removes_from(tmp_path, dt
     path = tmp_path / "cache.db"
     _write(path, table, _a_row_of(table))
     conn = db.get_db(path)
-    first, second, third, fourth, fifth = _sync_answers()
-    with first, second, third, fourth, fifth:
+    with contextlib.ExitStack() as stack:
+        for answer in _sync_answers():
+            stack.enter_context(answer)
         google_sync.GOOGLE_SYNC_HANDLERS[dtype](conn, date(2026, 3, 10), date(2026, 3, 16))
     conn.close()
     removed_by_its_sync = _rows(path, table) == []

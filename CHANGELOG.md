@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### When you ask about your heart rate
+
+- When during a night or a day it was high:
+  - `health_get_heart_rate_intraday` returns your heart rate through a window, as the lowest, average and highest rate per 5, 10, 15, 30 or 60 minutes, and says when it peaked. Use it to see whether a late dinner or an afternoon workout raised your pulse overnight.
+  - Without a window it covers the latest night's sleep in the cache. A window can run to 7 days.
+  - The cache keeps Google's five-minute summary of your heart rate rather than every reading.
+
+### When you ask about your activity
+
+- Active minutes:
+  - `health_get_activity` now fills `lightly_active_minutes`, `fairly_active_minutes`, `very_active_minutes` and `active_minutes` (fairly plus very) from Google's active minutes. Before, they were empty for anything synced from Google. `sedentary_minutes` stays empty: Google has no daily figure for it.
+
+### After upgrading
+
+- On a multi-host setup, upgrade the syncing host first and let it sync once. This release adds a table, and the first host to open the cache creates it.
+- A first sync of heart rate through the day covers the last 30 days. For older history, run `google-health-mcp sync --types heart_rate_intraday --since <date>`. For active minutes on days synced before this release, run `google-health-mcp sync --types activity --since <date>`.
+- This release asks for no new permission.
+
 ## 1.13.0 - 2026-11-22
 
 This release reads more of what Google holds: heart-rate zones, sedentary periods, altitude, swim lengths, breathing by sleep stage, and each food and drink you log. What you change or delete in the app now changes in the cache too, and a new rebuild shows anything else that differs from Google. This release asks for no new permission.

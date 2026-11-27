@@ -68,6 +68,12 @@ _TOOLS = [
         "No heart rate zones found for this period.",
         None,
     ),
+    (
+        heart_tools,
+        "health_get_heart_rate_intraday",
+        "No intraday heart rate found for this period.",
+        None,
+    ),
     (hrv_tools, "health_get_hrv", "No HRV data found for this period.", None),
     (
         rhythm_tools,

@@ -327,6 +327,7 @@ def populated_db(tmp_db):
 FETCHERS = {
     "list_google_data_points",
     "daily_roll_up",
+    "roll_up",
     "_daily_rows",
     "_rollup_values",
     "_samples",
