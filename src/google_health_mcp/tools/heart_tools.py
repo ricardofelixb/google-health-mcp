@@ -105,11 +105,14 @@ async def health_get_heart_rate_zones(
 #: The longest window the intraday tool answers, so a reply stays small.
 MAX_INTRADAY_DAYS = 7
 
-_MINUTE = "%Y-%m-%dT%H:%M"
+
+def _midnight(day: date) -> datetime:
+    """The host's local midnight starting `day`, at that date's own offset."""
+    return datetime(day.year, day.month, day.day).astimezone()
 
 
-def _moment(text: str, name: str) -> tuple[datetime, bool]:
-    """A time argument as an aware datetime, and whether it was a date alone.
+def _moment(text: str, name: str) -> tuple[datetime, date | None]:
+    """A time argument as an aware datetime, and its date when it was a date alone.
 
     A time with no offset is the host's local time, as is a date's midnight.
     """
@@ -118,48 +121,83 @@ def _moment(text: str, name: str) -> tuple[datetime, bool]:
     except ValueError:
         pass
     else:
-        return datetime(day.year, day.month, day.day).astimezone(), True
+        return _midnight(day), day
     try:
         moment = datetime.fromisoformat(text)
     except ValueError:
         raise InvalidDateError(
             f"Cannot parse {name}. Use YYYY-MM-DD, YYYY-MM-DDTHH:MM, or a time with an offset."
         ) from None
-    return (moment if moment.tzinfo else moment.astimezone()), False
+    return (moment if moment.tzinfo else moment.astimezone()), None
 
 
-def _intraday_window(start: str | None, end: str | None) -> tuple[datetime, datetime]:
-    """The window asked for, its end exclusive, defaulting to the latest sleep."""
+def _floor(moment: datetime, minutes: int) -> datetime:
+    """The start of the local-clock bucket `moment` falls in, at its own offset.
+
+    The offset is kept so the hour a clock repeats when it goes back stays two
+    hours rather than one.
+    """
+    local = moment.astimezone()
+    return local - timedelta(
+        minutes=(local.hour * 60 + local.minute) % minutes,
+        seconds=local.second,
+        microseconds=local.microsecond,
+    )
+
+
+def _ceil(moment: datetime, minutes: int) -> datetime:
+    floor = _floor(moment, minutes)
+    return floor if floor == moment else floor + timedelta(minutes=minutes)
+
+
+def _clock(moment: datetime) -> str:
+    """A local time to the minute with its offset, unambiguous across a clock change."""
+    return moment.astimezone().isoformat(timespec="minutes")
+
+
+def _latest_sleep() -> tuple[str, str] | None:
+    conn = db.get_db()
+    try:
+        return db.latest_sleep_window(conn)
+    finally:
+        conn.close()
+
+
+def _intraday_window(start: str | None, end: str | None, minutes: int) -> tuple[datetime, datetime]:
+    """The window asked for, its end exclusive, defaulting to the latest sleep.
+
+    Widened to whole buckets: the cache holds five-minute buckets, so a window
+    cutting one could only drop it or read all of it. The reply reports the
+    widened window as its start and end.
+    """
+    first = last = None
     if start is None:
         if end is not None:
             raise InvalidDateError("end needs a start.")
-
-        def _latest():
-            conn = db.get_db()
-            try:
-                return db.latest_sleep_window(conn)
-            finally:
-                conn.close()
-
-        night = _latest()
+        night = _latest_sleep()
         if night is not None:
             try:
-                return _moment(night[0], "start")[0], _moment(night[1], "end")[0]
+                first, last = _moment(night[0], "start")[0], _moment(night[1], "end")[0]
             except InvalidDateError:
                 pass
-        start = date.today().isoformat()
-    first, _ = _moment(start, "start")
-    if end is None:
-        last = first + timedelta(days=1)
-    else:
-        last, whole_day = _moment(end, "end")
-        if whole_day:
-            last += timedelta(days=1)
+        if first is None:
+            start = date.today().isoformat()
+    if first is None:
+        first, first_day = _moment(start, "start")
+        if end is None:
+            last = (
+                _midnight(first_day + timedelta(days=1)) if first_day else first + timedelta(days=1)
+            )
+        else:
+            last, last_day = _moment(end, "end")
+            if last_day:
+                # The next date's own midnight: a local day is not always 24 hours.
+                last = _midnight(last_day + timedelta(days=1))
     if last <= first:
         raise InvalidDateError("end must be after start.")
     if last - first > timedelta(days=MAX_INTRADAY_DAYS):
         raise InvalidDateError(f"The window can be at most {MAX_INTRADAY_DAYS} days.")
-    return first, last
+    return _floor(first, minutes), _ceil(last, minutes)
 
 
 def _bpm(heart: dict, key: str) -> float | None:
@@ -178,7 +216,7 @@ def _number(value: float) -> int | float:
 
 def _rebucket(days: list[dict], first: datetime, last: datetime, minutes: int) -> list[dict]:
     """The cached five-minute buckets inside [first, last), merged on the local clock."""
-    merged: dict[str, dict] = {}
+    merged: dict[datetime, dict] = {}
     for day in days:
         for point in day.get("points") or ():
             heart = point.get("heartRate") if isinstance(point, dict) else None
@@ -196,23 +234,21 @@ def _rebucket(days: list[dict], first: datetime, last: datetime, minutes: int) -
             )
             if low is None or mean is None or high is None:
                 continue
-            local = moment.astimezone().replace(tzinfo=None, second=0, microsecond=0)
-            local -= timedelta(minutes=(local.hour * 60 + local.minute) % minutes)
             bucket = merged.setdefault(
-                local.strftime(_MINUTE), {"min": low, "means": [], "max": high}
+                _floor(moment, minutes), {"min": low, "means": [], "max": high}
             )
             bucket["min"] = min(bucket["min"], low)
             bucket["max"] = max(bucket["max"], high)
             bucket["means"].append(mean)
     return [
         {
-            "time": time,
+            "time": _clock(moment),
             "min": _number(b["min"]),
             "avg": round(sum(b["means"]) / len(b["means"]), 1),
             "max": _number(b["max"]),
             "_means": b["means"],
         }
-        for time, b in sorted(merged.items())
+        for moment, b in sorted(merged.items())
     ]
 
 
@@ -233,21 +269,26 @@ async def health_get_heart_rate_intraday(
 
     Args:
         start: "YYYY-MM-DD" (local midnight), "YYYY-MM-DDTHH:MM" (local time),
-            or a time with an offset or Z. Default: the latest night's sleep
-            held in the cache, or today if none is.
+            or a time with an offset or Z. Default: the longest sleep session
+            of the latest night held in the cache, or today if none is.
         end: Same forms, exclusive; a date alone means the end of that day.
-            Default: a day after start. At most 7 days after start.
+            Default: a day after start. At most 7 days after start. Both ends
+            are widened to whole buckets, and the reply says where they fell.
         resolution_minutes: Bucket size, aligned to the local clock: 5, 10, 15,
             30 or 60. Default: 15.
         live: If true, re-fetch these days from the API before reading the cache.
 
-    Returns start and end (local time), resolution_minutes, buckets (each with
-    time, the local start of the bucket, min and max bpm, and avg, the mean of
-    its five-minute averages), and a
-    summary with the window's min, avg and max and max_at, the bucket the
-    highest reading fell in. Buckets with nothing worn are left out.
+    Times are local, to the minute, with their UTC offset, so the hour a clock
+    repeats when it goes back reads as two hours. Returns start and end (the
+    window as widened), resolution_minutes, buckets (each with time, the start
+    of the bucket, min and max bpm, and avg, the mean of its five-minute
+    averages), and a summary with the window's min, avg and max and max_at,
+    the bucket the highest reading fell in. Buckets with nothing worn are left
+    out.
     """
-    first, last = await anyio.to_thread.run_sync(lambda: _intraday_window(start, end))
+    first, last = await anyio.to_thread.run_sync(
+        lambda: _intraday_window(start, end, resolution_minutes)
+    )
     first_day = first.astimezone().date()
     last_day = (last - timedelta(microseconds=1)).astimezone().date()
 
@@ -273,8 +314,8 @@ async def health_get_heart_rate_intraday(
     peak = max(buckets, key=lambda b: b["max"])
     return format_response(
         {
-            "start": first.astimezone().strftime(_MINUTE),
-            "end": last.astimezone().strftime(_MINUTE),
+            "start": _clock(first),
+            "end": _clock(last),
             "resolution_minutes": resolution_minutes,
             "buckets": buckets,
             "summary": {

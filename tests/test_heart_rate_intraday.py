@@ -149,10 +149,10 @@ class TestTheTool:
                 _bucket("2026-03-15T22:15:00Z", low=47, mean=49.0, high=51),
             ],
         )
-        body, _ = await _call(_path(tmp_db), start="2026-03-15T23:00", end="2026-03-15T23:30")
+        body, _ = await _call(_path(tmp_db), start="2026-03-15T23:00+01:00", end="2026-03-15T23:30")
         assert body["buckets"] == [
-            {"time": "2026-03-15T23:00", "min": 48, "avg": 54.2, "max": 70},
-            {"time": "2026-03-15T23:15", "min": 47, "avg": 49.0, "max": 51},
+            {"time": "2026-03-15T23:00+01:00", "min": 48, "avg": 54.2, "max": 70},
+            {"time": "2026-03-15T23:15+01:00", "min": 47, "avg": 49.0, "max": 51},
         ]
         assert body["resolution_minutes"] == 15
 
@@ -165,21 +165,29 @@ class TestTheTool:
             ],
         )
         body, _ = await _call(
-            _path(tmp_db), start="2026-03-15T23:00", end="2026-03-16T01:00", resolution_minutes=60
+            _path(tmp_db),
+            start="2026-03-15T23:00+01:00",
+            end="2026-03-16T01:00+01:00",
+            resolution_minutes=60,
         )
-        assert body["summary"] == {"min": 50, "avg": 60.0, "max": 72, "max_at": "2026-03-16T00:00"}
+        assert body["summary"] == {
+            "min": 50,
+            "avg": 60.0,
+            "max": 72,
+            "max_at": "2026-03-16T00:00+01:00",
+        }
 
     async def test_the_window_is_cut_to_the_times_asked_for(self, tmp_db):
         _sync(tmp_db, [_bucket("2026-03-15T21:55:00Z"), _bucket("2026-03-15T22:00:00Z")])
-        body, _ = await _call(_path(tmp_db), start="2026-03-15T23:00", end="2026-03-15T23:30")
-        assert [b["time"] for b in body["buckets"]] == ["2026-03-15T23:00"]
+        body, _ = await _call(_path(tmp_db), start="2026-03-15T23:00+01:00", end="2026-03-15T23:30")
+        assert [b["time"] for b in body["buckets"]] == ["2026-03-15T23:00+01:00"]
 
     async def test_a_utc_time_is_read_as_that_instant(self, tmp_db):
         _sync(tmp_db, [_bucket("2026-03-15T22:00:00Z")])
         body, _ = await _call(
             _path(tmp_db), start="2026-03-15T22:00:00Z", end="2026-03-15T22:30:00Z"
         )
-        assert [b["time"] for b in body["buckets"]] == ["2026-03-15T23:00"]
+        assert [b["time"] for b in body["buckets"]] == ["2026-03-15T23:00+01:00"]
 
     async def test_a_date_alone_is_the_whole_local_day(self, tmp_db):
         # 23:30 UTC on the 14th is 00:30 on the 15th here; 23:00 UTC on the 15th is the 16th.
@@ -193,7 +201,10 @@ class TestTheTool:
             start=date(2026, 3, 14),
         )
         body, calls = await _call(_path(tmp_db), start="2026-03-15", resolution_minutes=60)
-        assert [b["time"] for b in body["buckets"]] == ["2026-03-15T00:00", "2026-03-15T23:00"]
+        assert [b["time"] for b in body["buckets"]] == [
+            "2026-03-15T00:00+01:00",
+            "2026-03-15T23:00+01:00",
+        ]
         assert {(c.args[1], c.args[2]) for c in calls} == {(date(2026, 3, 15), date(2026, 3, 15))}
 
     async def test_the_default_window_is_the_latest_sleep(self, tmp_db):
@@ -209,9 +220,9 @@ class TestTheTool:
         tmp_db.commit()
         _sync(tmp_db, [_bucket("2026-03-15T21:55:00Z"), _bucket("2026-03-15T22:00:00Z")])
         body, calls = await _call(_path(tmp_db))
-        assert body["start"] == "2026-03-15T23:00"
-        assert body["end"] == "2026-03-16T07:00"
-        assert [b["time"] for b in body["buckets"]] == ["2026-03-15T23:00"]
+        assert body["start"] == "2026-03-15T23:00+01:00"
+        assert body["end"] == "2026-03-16T07:00+01:00"
+        assert [b["time"] for b in body["buckets"]] == ["2026-03-15T23:00+01:00"]
         assert {c.args[0] for c in calls} == {"heart_rate_intraday"}
         assert {(c.args[1], c.args[2]) for c in calls} == {(date(2026, 3, 15), date(2026, 3, 16))}
 
@@ -225,7 +236,7 @@ class TestTheTool:
 
     async def test_an_end_before_the_start_is_refused(self, tmp_db):
         with pytest.raises(ToolError):
-            await _call(_path(tmp_db), start="2026-03-15T23:00", end="2026-03-15T22:00")
+            await _call(_path(tmp_db), start="2026-03-15T23:00+01:00", end="2026-03-15T22:00")
 
     async def test_an_unreadable_time_is_refused(self, tmp_db):
         with pytest.raises(ToolError):
@@ -243,3 +254,131 @@ class TestTheTool:
             await mcp.call_tool(
                 "health_get_heart_rate_intraday", {"start": "2026-03-15", "resolution_minutes": 7}
             )
+
+
+class TestTheWindowsEdges:
+    async def test_a_window_is_widened_to_whole_buckets_and_says_so(self, tmp_db):
+        # 23:03-23:07 here cuts both five-minute buckets; neither is dropped or half-read.
+        _sync(
+            tmp_db,
+            [
+                _bucket("2026-03-15T22:00:00Z", high=90),
+                _bucket("2026-03-15T22:05:00Z", high=60),
+                _bucket("2026-03-15T22:10:00Z", high=99),
+            ],
+        )
+        body, _ = await _call(
+            _path(tmp_db), start="2026-03-15T23:03", end="2026-03-15T23:07", resolution_minutes=5
+        )
+        assert (body["start"], body["end"]) == ("2026-03-15T23:00+01:00", "2026-03-15T23:10+01:00")
+        assert [b["time"] for b in body["buckets"]] == [
+            "2026-03-15T23:00+01:00",
+            "2026-03-15T23:05+01:00",
+        ]
+        assert body["summary"]["max_at"] == "2026-03-15T23:00+01:00"
+
+    async def test_the_widening_follows_the_resolution(self, tmp_db):
+        _sync(tmp_db, [_bucket("2026-03-15T22:00:00Z"), _bucket("2026-03-15T22:10:00Z")])
+        body, _ = await _call(_path(tmp_db), start="2026-03-15T23:07", end="2026-03-15T23:08")
+        assert (body["start"], body["end"]) == ("2026-03-15T23:00+01:00", "2026-03-15T23:15+01:00")
+        assert [b["time"] for b in body["buckets"]] == ["2026-03-15T23:00+01:00"]
+
+
+@pytest.fixture
+def _new_york(monkeypatch):
+    """A host that changes its clocks, so a local day is not always 24 hours."""
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+
+
+@pytest.mark.usefixtures("_new_york")
+class TestDaylightSaving:
+    async def test_a_date_on_the_short_day_ends_at_the_next_midnight(self, tmp_db):
+        # 2026-03-08 is 23 hours long; 04:30 UTC on the 9th is 00:30 the next day.
+        _sync(
+            tmp_db,
+            [_bucket("2026-03-09T03:30:00Z"), _bucket("2026-03-09T04:30:00Z")],
+            start=date(2026, 3, 8),
+            end=date(2026, 3, 9),
+        )
+        body, _ = await _call(_path(tmp_db), start="2026-03-08", resolution_minutes=60)
+        assert body["end"] == "2026-03-09T00:00-04:00"
+        assert [b["time"] for b in body["buckets"]] == ["2026-03-08T23:00-04:00"]
+
+    async def test_a_date_on_the_long_day_keeps_its_last_hour(self, tmp_db):
+        # 2026-11-01 is 25 hours long; 04:30 UTC on the 2nd is 23:30 that day.
+        _sync(
+            tmp_db,
+            [_bucket("2026-11-02T04:30:00Z")],
+            start=date(2026, 11, 1),
+            end=date(2026, 11, 2),
+        )
+        body, _ = await _call(_path(tmp_db), start="2026-11-01", end="2026-11-01")
+        assert body["end"] == "2026-11-02T00:00-05:00"
+        assert [b["time"] for b in body["buckets"]] == ["2026-11-01T23:30-05:00"]
+
+    async def test_the_repeated_hour_stays_two_hours(self, tmp_db):
+        # 05:30 and 06:30 UTC are both 01:30 on the clock, an hour apart.
+        _sync(
+            tmp_db,
+            [_bucket("2026-11-01T05:30:00Z", high=70), _bucket("2026-11-01T06:30:00Z", high=90)],
+            start=date(2026, 11, 1),
+            end=date(2026, 11, 1),
+        )
+        body, _ = await _call(_path(tmp_db), start="2026-11-01", resolution_minutes=60)
+        assert [(b["time"], b["max"]) for b in body["buckets"]] == [
+            ("2026-11-01T01:00-04:00", 70),
+            ("2026-11-01T01:00-05:00", 90),
+        ]
+        assert body["summary"]["max_at"] == "2026-11-01T01:00-05:00"
+
+
+class TestTheDefaultWindow:
+    def _session(self, tmp_db, identifier, start, end):
+        db.save_sleep_session(
+            tmp_db,
+            {
+                "session_id": identifier,
+                "date": "2026-03-16",
+                "start_time": start,
+                "end_time": end,
+                "record": "{}",
+                "provider": "google",
+            },
+        )
+
+    async def test_it_is_one_session_not_the_nights_span(self, tmp_db):
+        # The nightly row spans the night and the afternoon nap that share its date.
+        db.save_sleep(
+            tmp_db,
+            {
+                "date": "2026-03-16",
+                "start_time": "2026-03-15T22:00:00Z",
+                "end_time": "2026-03-16T14:00:00Z",
+            },
+        )
+        self._session(tmp_db, "fictional/night", "2026-03-15T22:00:00Z", "2026-03-16T06:00:00Z")
+        self._session(tmp_db, "fictional/nap", "2026-03-16T13:00:00Z", "2026-03-16T14:00:00Z")
+        tmp_db.commit()
+        # The night is the longer of the two; a reading between them is outside it.
+        _sync(
+            tmp_db,
+            [_bucket("2026-03-15T23:00:00Z"), _bucket("2026-03-16T09:00:00Z")],
+            end=date(2026, 3, 16),
+        )
+        body, _ = await _call(_path(tmp_db))
+        assert (body["start"], body["end"]) == ("2026-03-15T23:00+01:00", "2026-03-16T07:00+01:00")
+        assert [b["time"] for b in body["buckets"]] == ["2026-03-16T00:00+01:00"]
+
+    def test_a_newer_night_without_sessions_is_still_preferred(self, tmp_db):
+        self._session(tmp_db, "fictional/old", "2026-03-15T22:00:00Z", "2026-03-16T06:00:00Z")
+        db.save_sleep(
+            tmp_db,
+            {
+                "date": "2026-03-17",
+                "start_time": "2026-03-16T22:00:00Z",
+                "end_time": "2026-03-17T06:00:00Z",
+            },
+        )
+        tmp_db.commit()
+        assert db.latest_sleep_window(tmp_db) == ("2026-03-16T22:00:00Z", "2026-03-17T06:00:00Z")
