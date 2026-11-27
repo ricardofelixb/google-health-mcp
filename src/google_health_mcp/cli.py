@@ -23,7 +23,6 @@ logging.basicConfig(
 
 # Import MCP instance and register all tools
 from . import config  # noqa: E402
-from .fork import write_tools  # noqa: E402, F401  # fork: registers only when on
 from .mcp_instance import mcp  # noqa: E402
 from .tools import (  # noqa: E402
     activity_tools,  # noqa: E402, F401
@@ -45,6 +44,11 @@ from .tools import (  # noqa: E402
     temperature_tools,  # noqa: E402, F401
     weight_tools,  # noqa: E402, F401
 )
+
+# isort: split
+# Fork (docs/fork.md): registers the write tools only when on. Imported last, so
+# upstream's tools keep their registration order.
+from .fork import write_tools  # noqa: E402, F401
 
 
 def _version_text():

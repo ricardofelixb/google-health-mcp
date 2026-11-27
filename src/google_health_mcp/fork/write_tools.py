@@ -92,8 +92,10 @@ async def health_log_water(milliliters: float, time: str | None = None) -> str:
     return await _log("hydration-log", build)
 
 
-def _sample(field: str, value):
-    def build(zone, time):
+def _sample(field: str, value, time: str | None):
+    """A build for a one-instant reading: `{sampleTime, <field>: value}`."""
+
+    def build(zone):
         at = writes.when(time, zone)
         return {"sampleTime": writes.sample_time(at), field: value}, at, at
 
@@ -109,7 +111,7 @@ async def health_log_weight(kilograms: float, time: str | None = None) -> str:
         time: local ISO datetime it was measured. Default: now.
     """
     grams = writes.positive(kilograms, "kilograms", 1000) * 1000
-    return await _log("weight", lambda zone: _sample("weightGrams", grams)(zone, time))
+    return await _log("weight", _sample("weightGrams", grams, time))
 
 
 @require_auth
@@ -121,7 +123,7 @@ async def health_log_body_fat(percentage: float, time: str | None = None) -> str
         time: local ISO datetime it was measured. Default: now.
     """
     value = writes.positive(percentage, "percentage", 100)
-    return await _log("body-fat", lambda zone: _sample("percentage", value)(zone, time))
+    return await _log("body-fat", _sample("percentage", value, time))
 
 
 @require_auth
