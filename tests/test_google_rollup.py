@@ -8,7 +8,7 @@ this path it cannot be filled at all.
 
 import json
 import urllib.error
-from datetime import date
+from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,6 +25,17 @@ def _a_token_without_the_network(monkeypatch):
 def _rollup(points):
     resp = MagicMock()
     resp.read.return_value = json.dumps({"rollupDataPoints": points}).encode()
+    resp.__enter__ = lambda s: s
+    resp.__exit__ = lambda *a: None
+    return resp
+
+
+def _page(points, token=None):
+    body = {"rollupDataPoints": points}
+    if token:
+        body["nextPageToken"] = token
+    resp = MagicMock()
+    resp.read.return_value = json.dumps(body).encode()
     resp.__enter__ = lambda s: s
     resp.__exit__ = lambda *a: None
     return resp
@@ -205,3 +216,72 @@ class TestTheTwoReadPathsDoNotCross:
         with patch("urllib.request.urlopen", side_effect=err):
             with pytest.raises(api.HealthAPIError):
                 api.daily_roll_up("floors", date(2026, 3, 1), date(2026, 3, 2))
+
+
+def _utc(day, hour=0):
+    return datetime(2026, 3, day, hour, tzinfo=timezone.utc)
+
+
+class TestTheTimedRollup:
+    """`rollUp` buckets a type over physical time, the read path for intraday heart rate."""
+
+    def test_it_posts_a_utc_range_and_a_window_in_seconds(self):
+        with patch("urllib.request.urlopen", side_effect=[_page([])]) as m:
+            api.roll_up("heart-rate", _utc(10, 22), _utc(11, 7), 300)
+        request = m.call_args.args[0]
+        assert request.full_url.split("?")[0].endswith(
+            "/users/me/dataTypes/heart-rate/dataPoints:rollUp"
+        )
+        body = _bodies(m)[0]
+        assert body["range"] == {
+            "startTime": "2026-03-10T22:00:00Z",
+            "endTime": "2026-03-11T07:00:00Z",
+        }
+        assert body["windowSize"] == "300s"
+
+    def test_a_range_past_the_cap_is_asked_for_in_pieces(self):
+        """heart-rate rolls up at most 14 days a request."""
+        with patch("urllib.request.urlopen", side_effect=[_page([]), _page([])]) as m:
+            api.roll_up("heart-rate", _utc(1), _utc(20), 300)
+        ranges = [b["range"] for b in _bodies(m)]
+        assert ranges == [
+            {"startTime": "2026-03-01T00:00:00Z", "endTime": "2026-03-15T00:00:00Z"},
+            {"startTime": "2026-03-15T00:00:00Z", "endTime": "2026-03-20T00:00:00Z"},
+        ]
+
+    def test_pages_are_followed_with_the_rest_of_the_request_unchanged(self):
+        first = {"startTime": "2026-03-10T22:00:00Z", "heartRate": {"beatsPerMinuteAvg": 61}}
+        second = {"startTime": "2026-03-10T22:05:00Z", "heartRate": {"beatsPerMinuteAvg": 62}}
+        with patch(
+            "urllib.request.urlopen", side_effect=[_page([first], "next"), _page([second])]
+        ) as m:
+            got = api.roll_up("heart-rate", _utc(10, 22), _utc(11), 300)
+        assert got == [first, second]
+        bodies = _bodies(m)
+        assert bodies[1].pop("pageToken") == "next"
+        assert bodies[0] == bodies[1]
+
+    def test_an_empty_window_asks_nothing(self):
+        with patch("urllib.request.urlopen") as m:
+            assert api.roll_up("heart-rate", _utc(10), _utc(10), 300) == []
+        assert not m.called
+
+    def test_a_naive_time_is_refused(self):
+        """Without an offset the range would be read in whatever zone the host is in."""
+        with pytest.raises(ValueError, match="timezone"):
+            api.roll_up("heart-rate", datetime(2026, 3, 10), _utc(11), 300)
+
+    def test_a_type_this_package_does_not_read_is_refused(self):
+        with patch("urllib.request.urlopen") as m:
+            with pytest.raises(ValueError):
+                api.roll_up("not-a-type", _utc(10), _utc(11), 300)
+        assert not m.called
+
+    def test_a_response_of_the_wrong_shape_is_refused(self):
+        resp = MagicMock()
+        resp.read.return_value = json.dumps({"rollupDataPoints": {"heartRate": 1}}).encode()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        with patch("urllib.request.urlopen", side_effect=[resp]):
+            with pytest.raises(api.HealthAPIError, match="shape"):
+                api.roll_up("heart-rate", _utc(10), _utc(11), 300)
