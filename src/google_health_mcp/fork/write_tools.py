@@ -5,8 +5,6 @@ to undo a wrong log. Times are local ISO datetimes ("2026-03-10T22:00") read
 in the account's time zone unless they carry an offset; omitted means now.
 """
 
-from datetime import date
-
 import anyio
 
 from .. import config
@@ -21,7 +19,7 @@ async def _log(data_type: str, build) -> str:
     def _run():
         payload, first, last = build(writes.account_zone())
         point = writes.create(data_type, payload)
-        refreshed = writes.refresh_cache(data_type, first.date(), last.date())
+        refreshed = writes.after_create(data_type, point, first.date(), last.date())
         return {
             "logged": data_type,
             "data_point_id": point,
@@ -228,31 +226,19 @@ async def health_log_symptoms(symptoms: list[str], time: str | None = None) -> s
 
 
 @require_auth
-async def health_delete_logged(data_type: str, data_point_id: str, date: str | None = None) -> str:
-    """Delete a data point a health_log_* tool created, to fix a wrong log.
+async def health_delete_logged(data_type: str, data_point_id: str) -> str:
+    """Delete a data point a health_log_* tool on this server created, to fix a wrong log.
 
     Args:
         data_type: the `logged` value the log tool returned, e.g. "weight".
-        data_point_id: the `data_point_id` it returned.
-        date: optional local "YYYY-MM-DD" it was logged for, to refresh the cache that day.
+        data_point_id: the `data_point_id` it returned. Any other id is refused.
     """
-    day = _day(date)
 
     def _run():
-        writes.delete(data_type, data_point_id)
-        refreshed = day is not None and writes.refresh_cache(data_type, day, day)
+        refreshed = writes.delete(data_type, data_point_id)
         return {"deleted": data_point_id, "data_type": data_type, "cache_refreshed": refreshed}
 
     return format_response(await anyio.to_thread.run_sync(_run))
-
-
-def _day(text: str | None) -> date | None:
-    if text is None:
-        return None
-    try:
-        return date.fromisoformat(text)
-    except ValueError:
-        raise writes.WriteInputError(f"Unreadable date {text!r}. Use YYYY-MM-DD.") from None
 
 
 WRITE_TOOLS = (

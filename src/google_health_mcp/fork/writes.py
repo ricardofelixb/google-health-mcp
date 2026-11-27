@@ -9,16 +9,20 @@ the operation, never a response body or a resource name.
 
 import http.client
 import json
+import logging
 import re
+import sqlite3
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .. import api, config
+from .. import api, config, db
 from ..auth import RefreshNetworkError, TokenRefused, refresh_google_token
 from ..errors import GoogleHealthError
-from ..tools import sync_tools
+from ..tools import google_sync
+
+logger = logging.getLogger(__name__)
 
 
 class WriteInputError(GoogleHealthError):
@@ -196,26 +200,134 @@ def create(data_type: str, payload: dict) -> str | None:
     return point if point and _POINT_ID.fullmatch(point) else None
 
 
-def delete(data_type: str, point: str) -> None:
-    if data_type not in WRITERS or not _POINT_ID.fullmatch(str(point)):
+def delete(data_type: str, point: str) -> bool:
+    """Delete a point this server logged; whether its days' cache was refreshed.
+
+    Only a point in the ledger: an id a tracker or the app wrote is well formed
+    too, and is never this tool's to delete.
+    """
+    days = _logged_days(data_type, point)
+    if days is None:
         raise WriteInputError(
-            f"Cannot delete that. data_type is one of: {', '.join(WRITERS)}; "
-            "data_point_id is the id a log tool returned."
+            f"Cannot delete that. data_type is one of: {', '.join(WRITERS)}, and "
+            "data_point_id is the id a log tool on this server returned for it."
         )
     _post(
         f"users/me/dataTypes/{data_type}/dataPoints:batchDelete",
         {"names": [f"users/me/dataTypes/{data_type}/dataPoints/{point}"]},
         f"{data_type} batchDelete",
     )
+    return _best_effort(_after_delete, data_type, point, *days)
 
 
-def refresh_cache(data_type: str, first: date, last: date) -> bool:
-    """Re-sync the written days through the upstream sync, so the read tools see it."""
-    cached = list(WRITERS[data_type][1])
-    if not cached:
-        return False
+def after_create(data_type: str, point: str | None, first: date, last: date) -> bool:
+    """Record a created point as this server's, then refresh its days' cache.
+
+    Best-effort: the point exists whatever happens here, and its id must still
+    reach the caller, or a retry logs it twice.
+    """
+    return _best_effort(_after_create, data_type, point, first, last)
+
+
+#: Which points this server created, so delete can refuse any other, and the
+#: local days each covers, so a delete refreshes them. Fork-only, in the cache.
+_LEDGER = """CREATE TABLE IF NOT EXISTS fork_written_points (
+    data_type TEXT NOT NULL,
+    point_id TEXT NOT NULL,
+    first_date TEXT NOT NULL,
+    last_date TEXT NOT NULL,
+    PRIMARY KEY (data_type, point_id)
+)"""
+
+
+def _open():
+    conn = db.get_db()
+    conn.execute(_LEDGER)
+    return conn
+
+
+def _best_effort(step, *args) -> bool:
     try:
-        results = sync_tools.run_sync(cached, since=first.isoformat(), until=last.isoformat())
-    except GoogleHealthError:
+        conn = _open()
+        try:
+            return step(conn, *args)
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001 - the write is done; only its cache is at stake
+        logger.debug("cache step after a write failed: %s", type(e).__name__)
         return False
-    return all(r.get("status") == "ok" for r in results.values())
+
+
+def _after_create(conn, data_type, point, first, last) -> bool:
+    if point:
+        conn.execute(
+            "INSERT OR REPLACE INTO fork_written_points VALUES (?, ?, ?, ?)",
+            (data_type, point, first.isoformat(), last.isoformat()),
+        )
+        conn.commit()
+    if not _refresh(conn, data_type, first, last):
+        return False
+    if data_type == "exercise":
+        # Upstream leaves a day an import recorded to the import, so a workout
+        # logged that day is in Google but never in the cache.
+        return _holds(
+            conn, "SELECT log_id FROM exercises WHERE date BETWEEN ? AND ?", point, first, last
+        )
+    return True
+
+
+def _after_delete(conn, data_type, point, first, last) -> bool:
+    if data_type == "sleep":
+        # The sleep syncs only upsert, so a deleted session's rows stay unless
+        # removed here; the re-sync then rebuilds the night from what is left.
+        # A session's night is its local end date, as upstream dates it.
+        query = "SELECT session_id FROM sleep_sessions WHERE date BETWEEN ? AND ?"
+        gone = [{"session_id": n} for n in _names(conn, query, point, last, last)]
+        db.remove_rows(conn, "sleep_sessions", gone)
+        night = conn.execute(
+            "SELECT date FROM sleep WHERE date = ? AND provider = ?",
+            (last.isoformat(), google_sync.PROVIDER),
+        )
+        db.remove_rows(conn, "sleep", [{"date": r[0]} for r in night.fetchall()])
+    return _refresh(conn, data_type, first, last)
+
+
+def _refresh(conn, data_type, first, last) -> bool:
+    """Re-fetch the account-local days through upstream's normalisers.
+
+    The handlers directly rather than `run_sync`, which caps the range at the
+    host's today: an account ahead of the host would have its day dropped.
+    """
+    cached = WRITERS[data_type][1]
+    for table in cached:
+        google_sync.GOOGLE_SYNC_HANDLERS[table](conn, first, last)
+    conn.commit()
+    return bool(cached)
+
+
+def _names(conn, query, point, first, last) -> list[str]:
+    suffix = f"/dataPoints/{point}"
+    rows = conn.execute(query, (first.isoformat(), last.isoformat())).fetchall()
+    return [r[0] for r in rows if isinstance(r[0], str) and r[0].endswith(suffix)]
+
+
+def _holds(conn, query, point, first, last) -> bool:
+    return bool(point) and bool(_names(conn, query, point, first, last))
+
+
+def _logged_days(data_type: str, point: str) -> tuple[date, date] | None:
+    if data_type not in WRITERS or not _POINT_ID.fullmatch(str(point)):
+        return None
+    try:
+        conn = _open()
+        try:
+            row = conn.execute(
+                "SELECT first_date, last_date FROM fork_written_points "
+                "WHERE data_type = ? AND point_id = ?",
+                (data_type, point),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        raise WriteInputError("Could not read which points this server logged.") from None
+    return None if row is None else (date.fromisoformat(row[0]), date.fromisoformat(row[1]))
