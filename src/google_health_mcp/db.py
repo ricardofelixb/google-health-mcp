@@ -1180,6 +1180,16 @@ def route_ids(conn: sqlite3.Connection) -> set[str]:
     return {row[0] for row in conn.execute("SELECT log_id FROM exercise_routes")}
 
 
+def latest_sleep_window(conn: sqlite3.Connection) -> tuple[str, str] | None:
+    """The start and end of the latest night's sleep held with both, as stored."""
+    row = conn.execute(
+        "SELECT start_time, end_time FROM sleep"
+        " WHERE start_time IS NOT NULL AND end_time IS NOT NULL"
+        " ORDER BY date DESC, start_time DESC LIMIT 1"
+    ).fetchone()
+    return (row[0], row[1]) if row else None
+
+
 def query_sleep_sessions(conn: sqlite3.Connection, start_date: str, end_date: str) -> list[dict]:
     """Each session in a date range, its record decoded."""
     rows = conn.execute(
