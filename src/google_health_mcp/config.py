@@ -60,6 +60,7 @@ GOOGLE_SCOPE_READERS: dict[str, tuple[str, ...]] = {
         "swim-lengths-data",
     ),
     "health_metrics_and_measurements": (
+        "heart-rate",
         "daily-resting-heart-rate",
         "daily-heart-rate-zones",
         "daily-heart-rate-variability",
@@ -163,4 +164,5 @@ CACHED_DATA_TYPES = (
     "respiratory_rate_sleep",
     "food_entries",
     "water_entries",
+    "heart_rate_intraday",
 )

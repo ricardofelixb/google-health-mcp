@@ -26,8 +26,13 @@ def _windows(tmp_db, handler, day):
         asked.append((data_type, start, end))
         return []
 
+    def record_rollup(data_type, start, end, window_seconds):
+        # Physical time between local midnights, recorded as the local dates.
+        return record(data_type, start.date(), end.date())
+
     with (
         patch.object(google_sync.api, "list_google_data_points", side_effect=record),
+        patch.object(google_sync.api, "roll_up", side_effect=record_rollup),
         patch.object(google_sync.api, "daily_roll_up", side_effect=record),
         patch.object(google_sync.api, "get_profile", return_value={}),
         patch.object(google_sync.api, "get_settings", return_value={}),

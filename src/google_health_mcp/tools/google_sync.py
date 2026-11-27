@@ -822,7 +822,7 @@ def _with_margin(start, end):
 
 
 def _store_day_lists(
-    conn, points, field: str, day_of, save, start, end, emptied_table: str | None = None
+    conn, points, field: str | None, day_of, save, start, end, emptied_table: str | None = None
 ) -> int:
     """Each local day in [start, end] the answer holds, stored as its points as sent.
 
@@ -835,13 +835,15 @@ def _store_day_lists(
     removed from that table, as a day whose every entry was deleted;
     otherwise no row is ever removed. Days outside [start, end] are the
     request's margin and are left alone. The fetch stays in each handler,
-    where the scope check can read its data type. Returns the days written.
+    where the scope check can read its data type. With `field` None, `day_of`
+    is given the whole point, for a rollup bucket dated by its own start.
+    Returns the days written.
     """
     first, last = start.isoformat(), end.isoformat()
     days: dict[str, list] = {}
     unreadable = False
     for point in points:
-        payload = point.get(field)
+        payload = point if field is None else point.get(field)
         day = day_of(payload) if isinstance(payload, dict) else None
         if day is None:
             unreadable = True
@@ -936,6 +938,51 @@ def sync_water_entries(conn, start, end) -> int:
         end,
         emptied_table="water_entries",
     )
+
+
+#: The bucket the cache keeps heart rate in. Google stores it a second apart,
+#: and the tool's finest answer is this, so nothing finer is ever kept.
+HEART_RATE_BUCKET_SECONDS = 300
+
+
+def _local_midnight(day: date) -> datetime:
+    """The host's midnight starting `day`, as an aware datetime.
+
+    UTC's, for a day too early to convert: no reading is that old, and the
+    conversion raises at the first representable date.
+    """
+    try:
+        return datetime(day.year, day.month, day.day).astimezone()
+    except (ValueError, OverflowError):
+        return datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+
+
+def _bucket_day(point: dict) -> str | None:
+    """The host's local date a rollup bucket starts on, or None if it will not parse."""
+    try:
+        moment = datetime.fromisoformat(point.get("startTime"))
+    except (TypeError, ValueError):
+        return None
+    if moment.tzinfo is None:
+        return None
+    return moment.astimezone().date().isoformat()
+
+
+def sync_heart_rate_intraday(conn, start, end) -> int:
+    """Heart rate through each local day, as Google's five-minute rollup of it.
+
+    A rollup bucket is fixed physical time and carries no offset, so the days
+    are the host's: each bucket is dated by the local date it starts on, and
+    the request runs between local midnights, with the margin every day-list
+    type asks for. A bucket nothing was worn in carries no value and is not
+    kept, so a day with nothing worn writes no row.
+    """
+    first, last = _with_margin(start, end)
+    points = api.roll_up(
+        "heart-rate", _local_midnight(first), _local_midnight(last), HEART_RATE_BUCKET_SECONDS
+    )
+    worn = [p for p in points if isinstance(p, dict) and isinstance(p.get("heartRate"), dict)]
+    return _store_day_lists(conn, worn, None, _bucket_day, db.save_heart_rate_intraday, start, end)
 
 
 def sync_core_temperature(conn, start, end) -> int:
@@ -1442,6 +1489,7 @@ GOOGLE_SYNC_HANDLERS = {
     "respiratory_rate_sleep": sync_respiratory_rate_sleep,
     "food_entries": sync_food_entries,
     "water_entries": sync_water_entries,
+    "heart_rate_intraday": sync_heart_rate_intraday,
 }
 
 _METRICS = ("health_metrics_and_measurements",)
@@ -1479,4 +1527,5 @@ HANDLER_SCOPES = {
     "respiratory_rate_sleep": _METRICS,
     "food_entries": ("nutrition",),
     "water_entries": ("nutrition",),
+    "heart_rate_intraday": _METRICS,
 }

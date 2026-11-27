@@ -687,6 +687,7 @@ class TestNoWriterStampsADayItDidNotMeasure:
             with (
                 patch.object(google_sync.api, "list_google_data_points", return_value=points),
                 patch.object(google_sync.api, "daily_roll_up", return_value=points),
+                patch.object(google_sync.api, "roll_up", return_value=points),
                 # The account records have no date to be empty around: an
                 # empty record is their equivalent of a bare key.
                 patch.object(google_sync.api, "get_profile", return_value={}),

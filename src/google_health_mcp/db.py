@@ -300,6 +300,12 @@ CREATE TABLE IF NOT EXISTS water_entries (
     provider TEXT
 );
 
+CREATE TABLE IF NOT EXISTS heart_rate_intraday (
+    date TEXT PRIMARY KEY,
+    points TEXT,
+    provider TEXT
+);
+
 CREATE TABLE IF NOT EXISTS authorisation (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     missing_scopes TEXT,
@@ -419,6 +425,7 @@ _UPSERT_KEYS: dict[str, tuple[str, ...]] = {
     "respiratory_rate_sleep": ("date",),
     "food_entries": ("date",),
     "water_entries": ("date",),
+    "heart_rate_intraday": ("date",),
     "authorisation": ("id",),
 }
 
@@ -432,6 +439,7 @@ _DAY_LIST_TABLES = frozenset(
         "respiratory_rate_sleep",
         "food_entries",
         "water_entries",
+        "heart_rate_intraday",
     }
 )
 
@@ -707,6 +715,10 @@ def save_sedentary_periods(conn: sqlite3.Connection, row: dict):
     _upsert(conn, "sedentary_periods", row)
 
 
+def save_heart_rate_intraday(conn: sqlite3.Connection, row: dict):
+    _upsert(conn, "heart_rate_intraday", row)
+
+
 def save_altitude_gains(conn: sqlite3.Connection, row: dict):
     _upsert(conn, "altitude_gains", row)
 
@@ -871,6 +883,7 @@ _DATA_TABLE_MAP: dict[str, str] = {
     "respiratory_rate_sleep": "respiratory_rate_sleep",
     "food_entries": "food_entries",
     "water_entries": "water_entries",
+    "heart_rate_intraday": "heart_rate_intraday",
 }
 
 
