@@ -23,6 +23,7 @@ logging.basicConfig(
 
 # Import MCP instance and register all tools
 from . import config  # noqa: E402
+from .fork import write_tools  # noqa: E402, F401  # fork: registers only when on
 from .mcp_instance import mcp  # noqa: E402
 from .tools import (  # noqa: E402
     activity_tools,  # noqa: E402, F401
