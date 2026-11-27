@@ -4,16 +4,19 @@ import asyncio
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
-from google_health_mcp import api, config, helpers
+from google_health_mcp import api, config, db, helpers
 from google_health_mcp.fork import scopes, write_tools, writes
-from google_health_mcp.tools import sync_tools
+from google_health_mcp.tools import google_sync
 
 _POINT = "users/fictional-user-1/dataTypes/{}/dataPoints/fictional-point-7"
 
@@ -37,6 +40,10 @@ class FakeGoogle:
         return io.BytesIO(json.dumps({"done": True, "response": {"name": name}}).encode())
 
     @property
+    def types(self):
+        return [t for t, _, _ in self.synced]
+
+    @property
     def writes(self):
         return [c for c in self.calls if c[1] != "users/me/settings"]
 
@@ -51,13 +58,12 @@ def google(tmp_path, monkeypatch):
     monkeypatch.setattr(api, "refresh_google_token", lambda: "fictional-token")
     monkeypatch.setattr(writes, "refresh_google_token", lambda: "fictional-token")
     synced = []
-    monkeypatch.setattr(
-        sync_tools,
-        "run_sync",
-        lambda types, since=None, until=None, **_: (
-            synced.append((types, since, until)) or {t: {"status": "ok"} for t in types}
-        ),
-    )
+    for cached in {t for _, types in writes.WRITERS.values() for t in types}:
+        monkeypatch.setitem(
+            google_sync.GOOGLE_SYNC_HANDLERS,
+            cached,
+            lambda conn, start, end, t=cached: synced.append((t, str(start), str(end))),
+        )
     fake = FakeGoogle()
     fake.synced = synced
     monkeypatch.setattr(urllib.request, "urlopen", fake)
@@ -110,7 +116,10 @@ class TestEachWriteSendsTheDocumentedBody:
         ]
         assert out["data_point_id"] == "fictional-point-7"
         assert out["cache_refreshed"] is True
-        assert google.synced == [(["food_log", "food_entries"], "2026-03-10", "2026-03-10")]
+        assert google.synced == [
+            ("food_log", "2026-03-10", "2026-03-10"),
+            ("food_entries", "2026-03-10", "2026-03-10"),
+        ]
 
     def test_food_sends_only_what_was_given(self, google):
         _call(write_tools.health_log_food, food="Fictional soup", time=_EVENING)
@@ -123,7 +132,7 @@ class TestEachWriteSendsTheDocumentedBody:
             "users/me/dataTypes/hydration-log/dataPoints",
             {"hydrationLog": {"interval": _INSTANT, "amountConsumed": {"milliliters": 500}}},
         )
-        assert google.synced[0][0] == ["food_log", "water_entries"]
+        assert google.types == ["food_log", "water_entries"]
 
     def test_weight(self, google):
         _call(write_tools.health_log_weight, kilograms=70.5, time=_EVENING)
@@ -131,7 +140,7 @@ class TestEachWriteSendsTheDocumentedBody:
             "users/me/dataTypes/weight/dataPoints",
             {"weight": {"sampleTime": _SAMPLE, "weightGrams": 70500.0}},
         )
-        assert google.synced[0][0] == ["weight", "weight_readings"]
+        assert google.types == ["weight", "weight_readings"]
 
     def test_body_fat(self, google):
         _call(write_tools.health_log_body_fat, percentage=20, time=_EVENING)
@@ -139,7 +148,7 @@ class TestEachWriteSendsTheDocumentedBody:
             "users/me/dataTypes/body-fat/dataPoints",
             {"bodyFat": {"sampleTime": _SAMPLE, "percentage": 20}},
         )
-        assert google.synced[0][0] == ["weight", "body_fat_readings"]
+        assert google.types == ["weight", "body_fat_readings"]
 
     def test_exercise(self, google):
         _call(
@@ -166,7 +175,7 @@ class TestEachWriteSendsTheDocumentedBody:
                 }
             },
         )
-        assert google.synced[0][0] == ["exercises"]
+        assert google.types == ["exercises"]
 
     def test_sleep_refreshes_both_nights(self, google):
         _call(write_tools.health_log_sleep, start="2026-03-10T23:00", end="2026-03-11T07:00")
@@ -183,7 +192,10 @@ class TestEachWriteSendsTheDocumentedBody:
                 }
             },
         )
-        assert google.synced == [(["sleep", "sleep_sessions"], "2026-03-10", "2026-03-11")]
+        assert google.synced == [
+            ("sleep", "2026-03-10", "2026-03-11"),
+            ("sleep_sessions", "2026-03-10", "2026-03-11"),
+        ]
 
     def test_mood(self, google):
         out = _call(
@@ -218,12 +230,11 @@ class TestEachWriteSendsTheDocumentedBody:
 
 
 class TestDelete:
-    def test_deletes_by_batch_delete_and_refreshes_the_day(self, google):
+    def test_deletes_by_batch_delete_and_refreshes_the_logged_day(self, google):
+        _call(write_tools.health_log_weight, kilograms=70, time=_EVENING)
+        google.calls.clear(), google.synced.clear()
         out = _call(
-            write_tools.health_delete_logged,
-            data_type="weight",
-            data_point_id="fictional-point-7",
-            date="2026-03-10",
+            write_tools.health_delete_logged, data_type="weight", data_point_id="fictional-point-7"
         )
         assert google.writes == [
             (
@@ -233,15 +244,114 @@ class TestDelete:
             )
         ]
         assert out["deleted"] == "fictional-point-7" and out["cache_refreshed"] is True
-        assert google.synced == [(["weight", "weight_readings"], "2026-03-10", "2026-03-10")]
+        assert google.synced == [
+            ("weight", "2026-03-10", "2026-03-10"),
+            ("weight_readings", "2026-03-10", "2026-03-10"),
+        ]
 
     @pytest.mark.parametrize(
-        "data_type,point", [("steps", "fictional-point-7"), ("weight", "../settings")]
+        "data_type,point",
+        [
+            ("steps", "fictional-point-7"),
+            ("weight", "../settings"),
+            # Well formed, but not a point this server logged: one a tracker
+            # recorded is never this tool's to delete.
+            ("weight", "fictional-point-8"),
+            ("body-fat", "fictional-point-7"),
+        ],
     )
-    def test_refuses_what_this_server_does_not_write(self, google, data_type, point):
+    def test_refuses_what_this_server_did_not_create(self, google, data_type, point):
+        _call(write_tools.health_log_weight, kilograms=70, time=_EVENING)
+        google.calls.clear()
         with pytest.raises(Exception, match="Cannot delete"):
             asyncio.run(write_tools.health_delete_logged(data_type=data_type, data_point_id=point))
         assert google.writes == []
+
+    def test_deleting_sleep_clears_the_cached_session_and_night(self, google):
+        _call(write_tools.health_log_sleep, start="2026-03-10T23:00", end="2026-03-11T07:00")
+        name = _POINT.format("sleep")
+        conn = db.get_db()
+        db.save_sleep_session(
+            conn, {"session_id": name, "date": "2026-03-11", "record": "{}", "provider": "google"}
+        )
+        db.save_sleep_session(
+            conn,
+            {"session_id": name + "0", "date": "2026-03-11", "record": "{}", "provider": "google"},
+        )
+        db.save_sleep(conn, {"date": "2026-03-11", "total_minutes": 480, "provider": "google"})
+        conn.commit(), conn.close()
+        # The re-sync finds no session left, so it writes nothing: the sleep
+        # sync only upserts, and would leave both rows behind on its own.
+        _call(
+            write_tools.health_delete_logged, data_type="sleep", data_point_id="fictional-point-7"
+        )
+        conn = db.get_db()
+        sessions = [r[0] for r in conn.execute("SELECT session_id FROM sleep_sessions")]
+        nights = conn.execute("SELECT COUNT(*) FROM sleep").fetchone()[0]
+        conn.close()
+        assert sessions == [name + "0"] and nights == 0
+        assert google.types[-2:] == ["sleep", "sleep_sessions"]
+
+
+class TestTheCacheRefresh:
+    def test_a_cache_failure_still_returns_the_created_id(self, google, monkeypatch):
+        def broken(*_a, **_k):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(db, "get_db", broken)
+        out = _call(write_tools.health_log_weight, kilograms=70, time=_EVENING)
+        assert out["data_point_id"] == "fictional-point-7" and out["cache_refreshed"] is False
+        assert len(google.writes) == 1
+
+    def test_a_failing_sync_still_returns_the_created_id(self, google, monkeypatch):
+        def failing(conn, start, end):
+            raise api.HealthNetworkError("Network error.")
+
+        monkeypatch.setitem(google_sync.GOOGLE_SYNC_HANDLERS, "weight_readings", failing)
+        out = _call(write_tools.health_log_weight, kilograms=70, time=_EVENING)
+        assert out["data_point_id"] == "fictional-point-7" and out["cache_refreshed"] is False
+
+    def test_refreshes_the_account_day_even_when_the_host_is_a_day_behind(self, google):
+        """Tokyo is past midnight while this host is still on the day before."""
+        google.zone = "Asia/Tokyo"
+        tomorrow = (datetime.now(ZoneInfo("Asia/Tokyo")) + timedelta(days=1)).date()
+        _call(write_tools.health_log_weight, kilograms=70, time=f"{tomorrow}T00:30")
+        assert google.synced[-1] == ("weight_readings", str(tomorrow), str(tomorrow))
+
+    def test_a_workout_the_read_tools_will_not_show_is_not_called_refreshed(
+        self, google, monkeypatch
+    ):
+        """Upstream leaves a day an import recorded to the import, so a Google
+        workout that day never reaches the cache. Saying it was refreshed
+        would send the agent looking for a workout the read tools hide."""
+        conn = db.get_db()
+        conn.execute(
+            "INSERT INTO exercises (log_id, date) VALUES ('fictional-import-1', '2026-03-10')"
+        )
+        conn.commit(), conn.close()
+        workout = {
+            "name": _POINT.format("exercise"),
+            "exercise": {
+                "interval": {"startTime": "2026-03-10T11:00:00Z", "startUtcOffset": "-14400s"}
+            },
+        }
+        monkeypatch.setattr(api, "list_google_data_points", lambda *a, **k: [workout])
+        monkeypatch.setitem(
+            google_sync.GOOGLE_SYNC_HANDLERS, "exercises", google_sync.sync_exercises
+        )
+        args = {"exercise_type": "running", "start": "2026-03-10T07:00", "end": "2026-03-10T07:30"}
+        assert _call(write_tools.health_log_exercise, **args)["cache_refreshed"] is False
+
+    def test_a_workout_the_sync_stored_is_called_refreshed(self, google, monkeypatch):
+        def store(conn, start, end):
+            conn.execute(
+                "INSERT INTO exercises (log_id, date, provider) VALUES (?, ?, 'google')",
+                (_POINT.format("exercise"), str(start)),
+            )
+
+        monkeypatch.setitem(google_sync.GOOGLE_SYNC_HANDLERS, "exercises", store)
+        args = {"exercise_type": "running", "start": "2026-03-10T07:00", "end": "2026-03-10T07:30"}
+        assert _call(write_tools.health_log_exercise, **args)["cache_refreshed"] is True
 
 
 class TestRefusals:
