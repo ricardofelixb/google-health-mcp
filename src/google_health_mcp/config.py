@@ -52,6 +52,7 @@ GOOGLE_SCOPE_READERS: dict[str, tuple[str, ...]] = {
         "floors",
         "total-calories",
         "active-zone-minutes",
+        "active-minutes",
         "exercise",
         "daily-vo2-max",
         "sedentary-period",
