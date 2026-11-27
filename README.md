@@ -282,6 +282,7 @@ The console also offers `reproductive_health.readonly`, `logged_symptoms.readonl
 | `GOOGLE_HEALTH_MCP_CONFIG_DIR` | `~/.config/google-health-mcp/` | Directory holding the OAuth client and tokens |
 | `GOOGLE_HEALTH_MCP_DB_PATH` | `~/.local/share/google-health-mcp/google_health.db` | SQLite cache |
 | `GOOGLE_HEALTH_MCP_OFFLINE` | unset | If truthy (`1`, `true`, `yes`, `on`), run as a cache-only reader |
+| `GOOGLE_HEALTH_MCP_WRITE` | unset | Fork only: if truthy, request write scopes and register the logging tools ([below](#fork-write-tools-opt-in)) |
 
 ### Offline / cache-only mode
 
@@ -295,6 +296,15 @@ Typical uses:
 
 - **Several machines, one cache** - one host runs `google-health-mcp sync` from cron or systemd against a shared database; the others set `GOOGLE_HEALTH_MCP_OFFLINE=1`, point `GOOGLE_HEALTH_MCP_DB_PATH` at the same file, and only read.
 - **CI and privacy** - run queries with no network access and no credentials.
+
+### Fork: write tools (opt-in)
+
+This fork can also log to your account, so an agent can record what you tell it: a meal, a glass of water, a weight, a workout, a night's sleep, a mood or a symptom. It is off by default, and with it off the server behaves exactly as upstream. To turn it on:
+
+1. On the Cloud console **Data Access** page, also tick `nutrition.writeonly`, `health_metrics_and_measurements.writeonly`, `activity_and_fitness.writeonly`, `sleep.writeonly`, `mindfulness.writeonly` and `logged_symptoms.writeonly`.
+2. Set `GOOGLE_HEALTH_MCP_WRITE=1` for both `auth` and the server, and run `google-health-mcp auth` again, ticking every permission. A grant does not gain scopes on refresh; `doctor` warns while any write scope is missing.
+
+The server then adds `health_log_food`, `health_log_water`, `health_log_weight`, `health_log_body_fat`, `health_log_exercise`, `health_log_sleep`, `health_log_mood`, `health_log_symptoms` and `health_delete_logged`. Times are local ISO datetimes in your account's time zone. Each log returns a `data_point_id`; pass it to `health_delete_logged` to undo a wrong entry. Offline mode refuses writes. Details: [docs/fork.md](docs/fork.md).
 
 ## Rate limits
 
