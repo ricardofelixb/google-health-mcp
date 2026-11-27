@@ -26,6 +26,7 @@ class FakeGoogle:
 
     def __init__(self, zone="America/New_York", error=None):
         self.zone, self.error, self.calls = zone, error, []
+        self.answer = None  # replaces the write's documented `done: true` answer
 
     def __call__(self, req, timeout=None):
         body = json.loads(req.data) if req.data else None
@@ -37,6 +38,8 @@ class FakeGoogle:
             raise self.error
         data_type = url.split("/")[3].split(":")[0]
         name = _POINT.format(data_type)
+        if self.answer is not None:
+            return io.BytesIO(json.dumps(self.answer).encode())
         return io.BytesIO(json.dumps({"done": True, "response": {"name": name}}).encode())
 
     @property
@@ -125,6 +128,22 @@ class TestEachWriteSendsTheDocumentedBody:
         _call(write_tools.health_log_food, food="Fictional soup", time=_EVENING)
         body = google.writes[0][2]["nutritionLog"]
         assert set(body) == {"interval", "foodDisplayName"}
+
+    def test_food_takes_a_zero_estimate(self, google):
+        _call(
+            write_tools.health_log_food,
+            food="Fictional broth",
+            time=_EVENING,
+            calories=0,
+            protein_g=0,
+            carbs_g=0,
+            fat_g=0,
+        )
+        body = google.writes[0][2]["nutritionLog"]
+        assert body["energy"] == {"kcal": 0}
+        assert body["totalCarbohydrate"] == {"grams": 0}
+        assert body["totalFat"] == {"grams": 0}
+        assert body["nutrients"] == [{"nutrient": "PROTEIN", "quantity": {"grams": 0}}]
 
     def test_water(self, google):
         _call(write_tools.health_log_water, milliliters=500, time=_EVENING)
@@ -507,6 +526,40 @@ class TestRefusals:
         with pytest.raises(Exception, match="check before logging it again"):
             asyncio.run(write_tools.health_log_water(milliliters=250, time=_EVENING))
         assert len(google.writes) == 1
+
+    def test_a_pending_create_is_not_reported_as_logged(self, google):
+        google.answer = {"name": "operations/fictional-op", "done": False}
+        with pytest.raises(Exception) as caught:
+            asyncio.run(write_tools.health_log_water(milliliters=250, time=_EVENING))
+        assert str(caught.value) == (
+            "Google accepted the hydration-log create but has not finished it, so it "
+            "may still take effect; check before trying it again."
+        )
+        assert google.synced == []
+
+    def test_a_pending_delete_is_not_reported_as_deleted(self, google):
+        _call(write_tools.health_log_weight, kilograms=70, time=_EVENING)
+        google.synced.clear()
+        google.answer = {"name": "operations/fictional-op", "done": False}
+        with pytest.raises(Exception, match="has not finished it"):
+            asyncio.run(
+                write_tools.health_delete_logged(
+                    data_type="weight", data_point_id="fictional-point-7"
+                )
+            )
+        assert google.synced == []
+
+    @pytest.mark.parametrize(
+        "answer", [{"done": True, "response": ["unexpected"]}, ["unexpected"], "unexpected"]
+    )
+    def test_an_unexpected_answer_warns_the_log_may_exist(self, google, answer):
+        google.answer = answer
+        with pytest.raises(Exception) as caught:
+            asyncio.run(write_tools.health_log_water(milliliters=250, time=_EVENING))
+        assert str(caught.value) == (
+            "Google answered the hydration-log create in an unexpected form; it may "
+            "have been saved, so check before trying it again."
+        )
 
     def test_offline_mode_sends_nothing(self, google, monkeypatch):
         monkeypatch.setattr(config, "OFFLINE_MODE", True)
