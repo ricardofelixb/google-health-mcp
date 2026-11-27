@@ -20,7 +20,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import NamedTuple
 from urllib.parse import quote, urlencode
 
@@ -547,6 +547,67 @@ def daily_roll_up(data_type: str, start: date, end: date) -> list[dict]:
         if page is not None and not isinstance(page, list):
             raise HealthAPIError("Google returned an unexpected response shape.")
         points.extend(page or [])
+        window_start = window_end
+    return points
+
+
+def _timestamp(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def roll_up(data_type: str, start: datetime, end: datetime, window_seconds: int) -> list[dict]:
+    """One point per `window_seconds` bucket of [start, end), over physical time.
+
+    The intraday counterpart of `daily_roll_up`: buckets are fixed lengths of
+    UTC time rather than civil days, so a bucket's own `startTime` and
+    `endTime` say when it was. A bucket with nothing worn in it carries no
+    value, and is passed on as sent.
+
+    The range is chunked at the type's cap, as `daily_roll_up`'s is, and each
+    chunk is paged to exhaustion: unlike a daily window, a day of five-minute
+    buckets is more than the 1440 points a page holds by default.
+    """
+    spec = GOOGLE_TYPES.get(data_type)
+    if spec is None:
+        raise ValueError(f"{data_type} is not a data type this package reads")
+    if start.tzinfo is None or end.tzinfo is None:
+        raise ValueError("a rollup range needs a timezone")
+
+    points: list[dict] = []
+    window_start = start
+    deadline = time.monotonic() + GOOGLE_WALK_DEADLINE
+    while window_start < end:
+        window_end = min(window_start + timedelta(days=spec.rollup_cap_days), end)
+        body = {
+            "range": {"startTime": _timestamp(window_start), "endTime": _timestamp(window_end)},
+            "windowSize": f"{window_seconds}s",
+            "pageSize": GOOGLE_MAX_PAGE_SIZE,
+        }
+        token = None
+        for _ in range(GOOGLE_MAX_PAGES):
+            if time.monotonic() > deadline:
+                raise HealthAPIError(
+                    f"gave up rolling up {data_type} after {GOOGLE_WALK_DEADLINE}s"
+                )
+            try:
+                answer = google_get(
+                    f"users/me/dataTypes/{spec.path}/dataPoints:rollUp",
+                    {},
+                    {**body, "pageToken": token} if token else body,
+                )
+            except GoogleGatewayTimeout as e:
+                # Reported, as `daily_roll_up` reports it: the window is the only
+                # thing to shrink, and moving it changes which buckets are asked for.
+                raise HealthAPIError(f"Google timed out rolling up {data_type}") from e
+            page = answer.get("rollupDataPoints")
+            if page is not None and not isinstance(page, list):
+                raise HealthAPIError("Google returned an unexpected response shape.")
+            points.extend(page or [])
+            token = answer.get("nextPageToken")
+            if not token:
+                break
+        else:
+            raise HealthAPIError(f"too many pages for {data_type}")
         window_start = window_end
     return points
 

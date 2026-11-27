@@ -168,16 +168,102 @@ class TestTheThreeStatesOfARollup:
         assert db.query_activity(tmp_db, "2026-03-15", "2026-03-15")[0]["steps"] == 0
 
 
-class TestTheMinuteColumnsAreNotWritten:
-    """No reading of activity-level reproduces the five minute columns.
+def _minutes(*levels, day=15):
+    return _rollup_day(
+        "activeMinutes",
+        {
+            "activeMinutesRollupByActivityLevel": [
+                {"activityLevel": level, "activeMinutesSum": str(minutes)}
+                for level, minutes in levels
+            ]
+        },
+        day=day,
+    )
 
-    The raw list returns more minute-long segments than the day has minutes,
-    because it is the per-source view and the sources overlap; reconciled, it
-    covers well under the day. The type has no daily rollup, so nothing left
-    carries Google's own reconciliation.
+
+class TestTheMinuteColumns:
+    """Google's daily `active-minutes` rollup fills the three activity levels.
+
+    `activity-level` cannot: its raw list returns more minute-long segments
+    than the day has minutes, because it is the per-source view and the
+    sources overlap, and it has no daily rollup. `active-minutes` does, so the
+    reconciliation is Google's own.
     """
 
-    def test_a_google_sync_leaves_them_null(self, tmp_db, sync_activity):
+    def test_each_level_lands_in_its_column(self, tmp_db, sync_activity):
+        sync_activity(
+            rollups={
+                "active-minutes": [_minutes(("LIGHT", 190), ("MODERATE", 25), ("VIGOROUS", 12))]
+            }
+        )
+        row = db.query_activity(tmp_db, "2026-03-15", "2026-03-15")[0]
+        assert row["lightly_active_minutes"] == 190
+        assert row["fairly_active_minutes"] == 25
+        assert row["very_active_minutes"] == 12
+        # Moderate and vigorous, as the column has always been defined.
+        assert row["active_minutes"] == 37
+
+    def test_a_level_the_response_omits_is_absent_not_zero(self, tmp_db, sync_activity):
+        sync_activity(rollups={"active-minutes": [_minutes(("VIGOROUS", 12))]})
+        row = db.query_activity(tmp_db, "2026-03-15", "2026-03-15")[0]
+        assert row["very_active_minutes"] == 12
+        assert row["fairly_active_minutes"] is None
+        assert row["lightly_active_minutes"] is None
+        # The total needs both of its parts; one alone would understate it.
+        assert row["active_minutes"] is None
+
+    def test_a_partial_point_withdraws_the_stored_total(self, tmp_db, sync_activity):
+        """Vigorous alone changes one part, so the stored total no longer adds up."""
+        db.save_activity(
+            tmp_db,
+            {
+                "date": "2026-03-15",
+                "fairly_active_minutes": 25,
+                "very_active_minutes": 15,
+                "active_minutes": 40,
+            },
+        )
+        tmp_db.commit()
+        sync_activity(rollups={"active-minutes": [_minutes(("VIGOROUS", 12))]})
+        row = db.query_activity(tmp_db, "2026-03-15", "2026-03-15")[0]
+        assert row["fairly_active_minutes"] == 25
+        assert row["very_active_minutes"] == 12
+        assert row["active_minutes"] is None
+
+    def test_light_alone_leaves_a_stored_total_alone(self, tmp_db, sync_activity):
+        """Neither of the total's parts changed, so the stored total still holds."""
+        db.save_activity(
+            tmp_db,
+            {
+                "date": "2026-03-15",
+                "fairly_active_minutes": 25,
+                "very_active_minutes": 15,
+                "active_minutes": 40,
+            },
+        )
+        tmp_db.commit()
+        sync_activity(rollups={"active-minutes": [_minutes(("LIGHT", 190))]})
+        row = db.query_activity(tmp_db, "2026-03-15", "2026-03-15")[0]
+        assert row["lightly_active_minutes"] == 190
+        assert row["active_minutes"] == 40
+
+    def test_light_alone_names_no_active_total(self, tmp_db, sync_activity):
+        """`active_minutes` excludes light activity, so light alone says nothing of it."""
+        sync_activity(rollups={"active-minutes": [_minutes(("LIGHT", 190))]})
+        row = db.query_activity(tmp_db, "2026-03-15", "2026-03-15")[0]
+        assert row["lightly_active_minutes"] == 190
+        assert row["active_minutes"] is None
+
+    def test_a_point_with_no_level_writes_no_row(self, tmp_db, sync_activity):
+        sync_activity(rollups={"active-minutes": [_rollup_day("activeMinutes", {})]})
+        assert db.query_activity(tmp_db, "2026-03-01", "2026-04-01") == []
+
+    def test_sedentary_is_left_null(self, tmp_db, sync_activity):
+        """Nothing Google sends partitions a day, so it is not derived as the rest of one."""
+        sync_activity(rollups={"active-minutes": [_minutes(("LIGHT", 190), ("MODERATE", 25))]})
+        assert db.query_activity(tmp_db, "2026-03-15", "2026-03-15")[0]["sedentary_minutes"] is None
+
+    def test_a_google_sync_without_minutes_leaves_them_null(self, tmp_db, sync_activity):
         sync_activity(rollups={"steps": [_rollup_day("steps", {"countSum": "8000"})]})
         row = db.query_activity(tmp_db, "2026-03-15", "2026-03-15")[0]
         assert row["steps"] == 8000
@@ -190,18 +276,17 @@ class TestTheMinuteColumnsAreNotWritten:
         ):
             assert row[column] is None, column
 
-    def test_an_imported_row_keeps_its_own(self, tmp_db, sync_activity):
-        """Leaving them unwritten is what preserves an imported history of them."""
+    def test_an_imported_sedentary_figure_is_kept(self, tmp_db, sync_activity):
+        """Leaving the column unwritten is what preserves an imported history of it."""
         db.save_activity(
             tmp_db,
             {"date": "2026-03-15", "very_active_minutes": 45, "sedentary_minutes": 761},
         )
         tmp_db.commit()
-        sync_activity(rollups={"steps": [_rollup_day("steps", {"countSum": "8000"})]})
+        sync_activity(rollups={"active-minutes": [_minutes(("VIGOROUS", 12))]})
         row = db.query_activity(tmp_db, "2026-03-15", "2026-03-15")[0]
-        assert row["very_active_minutes"] == 45
+        assert row["very_active_minutes"] == 12
         assert row["sedentary_minutes"] == 761
-        assert row["steps"] == 8000
 
     def test_nothing_fetches_activity_level(self, tmp_db):
         """Not fetched at all, so a sync does not pay for data it discards."""

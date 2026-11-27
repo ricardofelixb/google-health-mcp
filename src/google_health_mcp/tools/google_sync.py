@@ -435,8 +435,33 @@ def _rollup_values(
     return values
 
 
+#: Google's activity levels, and the column each one's minutes fill.
+_ACTIVITY_LEVEL_COLUMNS = {
+    "LIGHT": "lightly_active_minutes",
+    "MODERATE": "fairly_active_minutes",
+    "VIGOROUS": "very_active_minutes",
+}
+
+
+def _activity_minutes(payload: dict) -> dict | None:
+    """The minute columns one `active-minutes` rollup point fills, or None for none."""
+    levels = payload.get("activeMinutesRollupByActivityLevel")
+    columns = {}
+    for entry in levels if isinstance(levels, list) else ():
+        column = _ACTIVITY_LEVEL_COLUMNS.get(entry.get("activityLevel"))
+        minutes = _number(entry.get("activeMinutesSum"), int)
+        if column is not None and minutes is not None:
+            columns[column] = minutes
+    parts = [columns.get(c) for c in ("fairly_active_minutes", "very_active_minutes")]
+    if parts != [None, None]:
+        # A part written alone would leave a stored total that no longer adds
+        # up, so the total is rewritten with its parts, or withdrawn.
+        columns["active_minutes"] = None if None in parts else sum(parts)
+    return columns or None
+
+
 def sync_activity(conn, start, end) -> int:
-    """A day of activity, assembled from four rollups.
+    """A day of activity, assembled from five rollups.
 
     Each source is independent, so a day present in one and missing from
     another still gets a row carrying what is known - the upsert leaves the
@@ -446,22 +471,25 @@ def sync_activity(conn, start, end) -> int:
     and basal energy: basal can return nothing at all for an account, so that
     sum would silently drop the larger half of the number.
 
-    **The five minute columns are deliberately not written**, `active_minutes`
-    among them: it is very_active + fairly_active, so it has no source in this
-    API without those two. Google's `activity-level` vocabulary maps one to one
-    onto the other four, but no reading of it partitions a day. The raw list
-    returns more minute-long segments than the day has minutes, because `list`
-    is the per-source view and the sources overlap. The type has no daily
-    rollup: the API says so plainly, whatever the discovery document's value
-    union implies. So no rollup carries Google's own reconciliation, and the one
-    reconciled view covers well under the day. De-duplicating the raw stream
-    ourselves would mean inventing a precedence rule between sources and
-    presenting it as Google's number, and deriving sedentary as the day minus
-    the rest would rest on the four levels partitioning a day, which they
-    measurably do not.
+    The activity minutes come from `active-minutes`, Google's daily rollup of
+    time at each activity level: LIGHT, MODERATE and VIGOROUS fill
+    `lightly_active_minutes`, `fairly_active_minutes` and `very_active_minutes`,
+    and `active_minutes` is the moderate plus the vigorous minutes, as the
+    column has always been defined. A level the point omits is left unwritten
+    rather than read as zero, as `sync_azm` treats a zone. The total is
+    written whenever either of its parts is, and withdrawn when only one is:
+    one part alone would understate it, and a stored total beside a rewritten
+    part would no longer add up. A point naming neither leaves it untouched.
 
-    So they stay NULL, as `sleep.efficiency` and `weight.bmi` already do, and
-    an imported row's values beside them are left untouched.
+    `activity-level` is not read for them, though its vocabulary maps onto the
+    same columns: its raw list returns more minute-long segments than the day
+    has minutes, because `list` is the per-source view and the sources
+    overlap, and it has no daily rollup to carry Google's reconciliation.
+
+    `sedentary_minutes` is not written: nothing Google sends partitions a day,
+    so deriving it as the day minus the rest would invent a number. It stays
+    NULL, as `sleep.efficiency` and `weight.bmi` already do, and an imported
+    row's value is left untouched.
     """
     steps = _rollup_values("steps", start, end, "steps", lambda p: _number(p.get("countSum"), int))
     distance = _rollup_values(
@@ -481,9 +509,10 @@ def sync_activity(conn, start, end) -> int:
     calories = _rollup_values(
         "total-calories", start, end, "totalCalories", lambda p: _number(p.get("kcalSum"), float)
     )
+    minutes = _rollup_values("active-minutes", start, end, "activeMinutes", _activity_minutes)
     count = 0
-    for day in sorted(set(steps) | set(distance) | set(floors) | set(calories)):
-        row = {"date": day, "provider": PROVIDER}
+    for day in sorted(set(steps) | set(distance) | set(floors) | set(calories) | set(minutes)):
+        row = {"date": day, "provider": PROVIDER, **minutes.get(day, {})}
         for source, column in (
             (steps, "steps"),
             (distance, "distance_km"),
@@ -798,7 +827,7 @@ def _with_margin(start, end):
 
 
 def _store_day_lists(
-    conn, points, field: str, day_of, save, start, end, emptied_table: str | None = None
+    conn, points, field: str | None, day_of, save, start, end, emptied_table: str | None = None
 ) -> int:
     """Each local day in [start, end] the answer holds, stored as its points as sent.
 
@@ -811,13 +840,15 @@ def _store_day_lists(
     removed from that table, as a day whose every entry was deleted;
     otherwise no row is ever removed. Days outside [start, end] are the
     request's margin and are left alone. The fetch stays in each handler,
-    where the scope check can read its data type. Returns the days written.
+    where the scope check can read its data type. With `field` None, `day_of`
+    is given the whole point, for a rollup bucket dated by its own start.
+    Returns the days written.
     """
     first, last = start.isoformat(), end.isoformat()
     days: dict[str, list] = {}
     unreadable = False
     for point in points:
-        payload = point.get(field)
+        payload = point if field is None else point.get(field)
         day = day_of(payload) if isinstance(payload, dict) else None
         if day is None:
             unreadable = True
@@ -912,6 +943,51 @@ def sync_water_entries(conn, start, end) -> int:
         end,
         emptied_table="water_entries",
     )
+
+
+#: The bucket the cache keeps heart rate in. Google stores it a second apart,
+#: and the tool's finest answer is this, so nothing finer is ever kept.
+HEART_RATE_BUCKET_SECONDS = 300
+
+
+def _local_midnight(day: date) -> datetime:
+    """The host's midnight starting `day`, as an aware datetime.
+
+    UTC's, for a day too early to convert: no reading is that old, and the
+    conversion raises at the first representable date.
+    """
+    try:
+        return datetime(day.year, day.month, day.day).astimezone()
+    except (ValueError, OverflowError):
+        return datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+
+
+def _bucket_day(point: dict) -> str | None:
+    """The host's local date a rollup bucket starts on, or None if it will not parse."""
+    try:
+        moment = datetime.fromisoformat(point.get("startTime"))
+    except (TypeError, ValueError):
+        return None
+    if moment.tzinfo is None:
+        return None
+    return moment.astimezone().date().isoformat()
+
+
+def sync_heart_rate_intraday(conn, start, end) -> int:
+    """Heart rate through each local day, as Google's five-minute rollup of it.
+
+    A rollup bucket is fixed physical time and carries no offset, so the days
+    are the host's: each bucket is dated by the local date it starts on, and
+    the request runs between local midnights, with the margin every day-list
+    type asks for. A bucket nothing was worn in carries no value and is not
+    kept, so a day with nothing worn writes no row.
+    """
+    first, last = _with_margin(start, end)
+    points = api.roll_up(
+        "heart-rate", _local_midnight(first), _local_midnight(last), HEART_RATE_BUCKET_SECONDS
+    )
+    worn = [p for p in points if isinstance(p, dict) and isinstance(p.get("heartRate"), dict)]
+    return _store_day_lists(conn, worn, None, _bucket_day, db.save_heart_rate_intraday, start, end)
 
 
 def sync_core_temperature(conn, start, end) -> int:
@@ -1418,6 +1494,7 @@ GOOGLE_SYNC_HANDLERS = {
     "respiratory_rate_sleep": sync_respiratory_rate_sleep,
     "food_entries": sync_food_entries,
     "water_entries": sync_water_entries,
+    "heart_rate_intraday": sync_heart_rate_intraday,
 }
 
 _METRICS = ("health_metrics_and_measurements",)
@@ -1455,4 +1532,5 @@ HANDLER_SCOPES = {
     "respiratory_rate_sleep": _METRICS,
     "food_entries": ("nutrition",),
     "water_entries": ("nutrition",),
+    "heart_rate_intraday": _METRICS,
 }

@@ -300,6 +300,12 @@ CREATE TABLE IF NOT EXISTS water_entries (
     provider TEXT
 );
 
+CREATE TABLE IF NOT EXISTS heart_rate_intraday (
+    date TEXT PRIMARY KEY,
+    points TEXT,
+    provider TEXT
+);
+
 CREATE TABLE IF NOT EXISTS authorisation (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     missing_scopes TEXT,
@@ -419,6 +425,7 @@ _UPSERT_KEYS: dict[str, tuple[str, ...]] = {
     "respiratory_rate_sleep": ("date",),
     "food_entries": ("date",),
     "water_entries": ("date",),
+    "heart_rate_intraday": ("date",),
     "authorisation": ("id",),
 }
 
@@ -432,6 +439,7 @@ _DAY_LIST_TABLES = frozenset(
         "respiratory_rate_sleep",
         "food_entries",
         "water_entries",
+        "heart_rate_intraday",
     }
 )
 
@@ -707,6 +715,10 @@ def save_sedentary_periods(conn: sqlite3.Connection, row: dict):
     _upsert(conn, "sedentary_periods", row)
 
 
+def save_heart_rate_intraday(conn: sqlite3.Connection, row: dict):
+    _upsert(conn, "heart_rate_intraday", row)
+
+
 def save_altitude_gains(conn: sqlite3.Connection, row: dict):
     _upsert(conn, "altitude_gains", row)
 
@@ -871,6 +883,7 @@ _DATA_TABLE_MAP: dict[str, str] = {
     "respiratory_rate_sleep": "respiratory_rate_sleep",
     "food_entries": "food_entries",
     "water_entries": "water_entries",
+    "heart_rate_intraday": "heart_rate_intraday",
 }
 
 
@@ -1165,6 +1178,35 @@ def query_exercise_route(conn: sqlite3.Connection, log_id: str) -> dict | None:
 def route_ids(conn: sqlite3.Connection) -> set[str]:
     """The exercises whose route is already held."""
     return {row[0] for row in conn.execute("SELECT log_id FROM exercise_routes")}
+
+
+def latest_sleep_window(conn: sqlite3.Connection) -> tuple[str, str] | None:
+    """The start and end of the latest night's sleep held with both, as stored.
+
+    The longest session dated that night, since the nightly `sleep` row spans
+    every session sharing its date - a night and an afternoon nap read as one
+    span with the hours awake between them. The nightly row stands in only
+    when no session is held for the latest night and the row is one session,
+    as on an imported history; otherwise there is no window, not that span.
+    """
+    held = " WHERE start_time IS NOT NULL AND end_time IS NOT NULL"
+    night = conn.execute(
+        "SELECT date, start_time, end_time, sessions FROM sleep"
+        + held
+        + " ORDER BY date DESC, start_time DESC LIMIT 1"
+    ).fetchone()
+    session = conn.execute(
+        "SELECT date, start_time, end_time FROM sleep_sessions"
+        + held
+        + " AND date = (SELECT MAX(date) FROM sleep_sessions"
+        + held
+        + ") ORDER BY julianday(end_time) - julianday(start_time) DESC, start_time DESC LIMIT 1"
+    ).fetchone()
+    if session is not None and (night is None or session[0] >= night[0]):
+        return session[1], session[2]
+    if night is None or (night[3] or 1) > 1:
+        return None
+    return night[1], night[2]
 
 
 def query_sleep_sessions(conn: sqlite3.Connection, start_date: str, end_date: str) -> list[dict]:

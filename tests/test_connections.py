@@ -41,6 +41,8 @@ _TOOLS = [
     (food_tools, "health_get_food_log", "query_food_log"),
     (heart_tools, "health_get_heart_rate", "query_heart_rate"),
     (heart_tools, "health_get_heart_rate_zones", "query_heart_rate_zones"),
+    # Called with no window, it reads the latest night's sleep first.
+    (heart_tools, "health_get_heart_rate_intraday", "latest_sleep_window"),
     (hrv_tools, "health_get_hrv", "query_hrv"),
     (rhythm_tools, "health_get_ecg", "query_ecg"),
     (rhythm_tools, "health_get_irregular_rhythm", "query_irn"),
