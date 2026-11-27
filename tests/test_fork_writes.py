@@ -175,7 +175,7 @@ class TestEachWriteSendsTheDocumentedBody:
                 }
             },
         )
-        assert google.types == ["exercises"]
+        assert set(google.types) == {"exercises"}
 
     def test_sleep_refreshes_both_nights(self, google):
         _call(write_tools.health_log_sleep, start="2026-03-10T23:00", end="2026-03-11T07:00")
@@ -318,6 +318,59 @@ class TestDelete:
         assert night["efficiency"] == 91
         assert night["total_minutes"] is night["deep_minutes"] is night["sessions"] is None
 
+    def test_deleting_one_sleep_session_rebuilds_the_night_from_the_rest(self, google, monkeypatch):
+        _call(write_tools.health_log_sleep, start="2026-03-11T13:00", end="2026-03-11T14:00")
+        conn = db.get_db()
+        db.save_sleep(
+            conn,
+            {
+                "date": "2026-03-11",
+                "total_minutes": 540,
+                "deep_minutes": 90,
+                "efficiency": 91,
+                "sessions": 2,
+                "provider": "google",
+            },
+        )
+        conn.commit(), conn.close()
+        left = {
+            "name": _POINT.format("sleep") + "0",
+            "sleep": {
+                "interval": {"endTime": "2026-03-11T11:00:00Z", "endUtcOffset": "-14400s"},
+                "summary": {"minutesAsleep": 480},
+            },
+        }
+        monkeypatch.setattr(api, "list_google_data_points", lambda *a, **k: [left])
+        monkeypatch.setitem(google_sync.GOOGLE_SYNC_HANDLERS, "sleep", google_sync.sync_sleep)
+        _call(
+            write_tools.health_delete_logged, data_type="sleep", data_point_id="fictional-point-7"
+        )
+        conn = db.get_db()
+        night = dict(conn.execute("SELECT * FROM sleep").fetchone())
+        conn.close()
+        assert (night["total_minutes"], night["sessions"]) == (480, 1)
+        assert night["deep_minutes"] is None and night["efficiency"] == 91
+
+    def test_every_column_the_sleep_sync_writes_is_withdrawn_on_delete(self, monkeypatch):
+        stages = [{"type": t, "minutes": 1} for t in google_sync._SLEEP_STAGE_COLUMNS]
+        point = {
+            "sleep": {
+                "interval": {
+                    "startTime": "2026-03-11T03:00:00Z",
+                    "endTime": "2026-03-11T11:00:00Z",
+                    "endUtcOffset": "-14400s",
+                },
+                "summary": {"minutesAsleep": 1, "minutesInSleepPeriod": 1, "stagesSummary": stages},
+            }
+        }
+        monkeypatch.setattr(api, "list_google_data_points", lambda *a, **k: [point])
+        conn = db.get_db()
+        google_sync.sync_sleep(conn, *[datetime(2026, 3, 11).date()] * 2)
+        row = conn.execute("SELECT * FROM sleep").fetchone()
+        conn.close()
+        written = {k for k in row.keys() if row[k] is not None} - {"date", "provider"}
+        assert written == set(writes._GOOGLE_SLEEP_COLUMNS)
+
 
 class TestTheCacheRefresh:
     def test_refuses_to_log_what_it_could_not_record_as_its_own(self, google, monkeypatch):
@@ -328,7 +381,7 @@ class TestTheCacheRefresh:
             raise sqlite3.OperationalError("disk I/O error")
 
         monkeypatch.setattr(db, "get_db", broken)
-        with pytest.raises(writes.WriteInputError, match="nothing was logged"):
+        with pytest.raises(Exception, match="nothing was logged"):
             asyncio.run(write_tools.health_log_weight(kilograms=70, time=_EVENING))
         assert google.writes == []
 

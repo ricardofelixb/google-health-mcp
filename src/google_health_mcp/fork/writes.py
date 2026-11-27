@@ -220,13 +220,36 @@ def delete(data_type: str, point: str) -> bool:
     return _best_effort(_after_delete, data_type, point, *days)
 
 
-def after_create(data_type: str, point: str | None, first: date, last: date) -> bool:
-    """Record a created point as this server's, then refresh its days' cache.
+def log(data_type: str, payload: dict, first: date, last: date) -> tuple[str | None, bool]:
+    """Create a point, record it as this server's, refresh its days' cache.
 
-    Best-effort: the point exists whatever happens here, and its id must still
-    reach the caller, or a retry logs it twice.
+    The ledger is proven writable before anything is sent: a point created
+    while it cannot be recorded could never be deleted here. After the create
+    everything is best-effort, as the point exists whatever happens and its id
+    must still reach the caller, or a retry logs it twice.
     """
-    return _best_effort(_after_create, data_type, point, first, last)
+    try:
+        conn = _open()
+    except Exception as e:  # noqa: BLE001 - refused before anything is sent
+        logger.debug("could not open the ledger: %s", type(e).__name__)
+        raise WriteInputError(_UNRECORDABLE) from None
+    try:
+        try:
+            conn.execute("INSERT INTO fork_written_points VALUES ('', '', '', '')")
+            conn.rollback()
+        except sqlite3.Error as e:
+            logger.debug("the ledger is not writable: %s", type(e).__name__)
+            raise WriteInputError(_UNRECORDABLE) from None
+        point = create(data_type, payload)
+        return point, _best_effort_on(conn, _after_create, data_type, point, first, last)
+    finally:
+        conn.close()
+
+
+_UNRECORDABLE = (
+    "The cache could not record this log as one this server made, so nothing was "
+    "logged: a log it cannot record could not be deleted here."
+)
 
 
 #: Which points this server created, so delete can refuse any other, and the
@@ -249,10 +272,18 @@ def _open():
 def _best_effort(step, *args) -> bool:
     try:
         conn = _open()
-        try:
-            return step(conn, *args)
-        finally:
-            conn.close()
+    except Exception as e:  # noqa: BLE001 - the write is done; only its cache is at stake
+        logger.debug("cache step after a write failed: %s", type(e).__name__)
+        return False
+    try:
+        return _best_effort_on(conn, step, *args)
+    finally:
+        conn.close()
+
+
+def _best_effort_on(conn, step, *args) -> bool:
+    try:
+        return step(conn, *args)
     except Exception as e:  # noqa: BLE001 - the write is done; only its cache is at stake
         logger.debug("cache step after a write failed: %s", type(e).__name__)
         return False
@@ -268,28 +299,74 @@ def _after_create(conn, data_type, point, first, last) -> bool:
     if not _refresh(conn, data_type, first, last):
         return False
     if data_type == "exercise":
-        # Upstream leaves a day an import recorded to the import, so a workout
-        # logged that day is in Google but never in the cache.
-        return _holds(
-            conn, "SELECT log_id FROM exercises WHERE date BETWEEN ? AND ?", point, first, last
-        )
+        return _store_workout(conn, point, first, last)
     return True
 
 
+def _store_workout(conn, point, first, last) -> bool:
+    """Store a logged workout even on a day an import recorded.
+
+    Upstream leaves such a day to the import, so a workout both hold is not
+    stored twice; one this server just logged is in no import. Its day is
+    normalised by upstream's own handler in a scratch cache holding no import,
+    and only that workout's row is copied across. A later sync keeps it, as
+    Google still holds it, and removes it once deleted.
+    """
+    query = "SELECT log_id FROM exercises WHERE date BETWEEN ? AND ?"
+    if not point or _holds(conn, query, point, first, last):
+        return bool(point)
+    scratch = db.get_db(":memory:")
+    try:
+        google_sync.GOOGLE_SYNC_HANDLERS["exercises"](scratch, first, last)
+        for name in _names(scratch, query, point, first, last):
+            row = dict(
+                scratch.execute("SELECT * FROM exercises WHERE log_id = ?", (name,)).fetchone()
+            )
+            db.save_exercise(conn, row.pop("log_id"), row)
+    finally:
+        scratch.close()
+    conn.commit()
+    return _holds(conn, query, point, first, last)
+
+
 def _after_delete(conn, data_type, point, first, last) -> bool:
-    if data_type == "sleep":
-        # The sleep syncs only upsert, so a deleted session's rows stay unless
-        # removed here; the re-sync then rebuilds the night from what is left.
-        # A session's night is its local end date, as upstream dates it.
-        query = "SELECT session_id FROM sleep_sessions WHERE date BETWEEN ? AND ?"
-        gone = [{"session_id": n} for n in _names(conn, query, point, last, last)]
-        db.remove_rows(conn, "sleep_sessions", gone)
-        night = conn.execute(
-            "SELECT date FROM sleep WHERE date = ? AND provider = ?",
-            (last.isoformat(), google_sync.PROVIDER),
-        )
-        db.remove_rows(conn, "sleep", [{"date": r[0]} for r in night.fetchall()])
-    return _refresh(conn, data_type, first, last)
+    if data_type != "sleep":
+        return _refresh(conn, data_type, first, last)
+    # The sleep syncs only upsert, so a deleted session's rows stay unless
+    # removed here; the re-sync then rebuilds the night from what is left.
+    # A session's night is its local end date, as upstream dates it.
+    night = last.isoformat()
+    query = "SELECT session_id FROM sleep_sessions WHERE date BETWEEN ? AND ?"
+    gone = [{"session_id": n} for n in _names(conn, query, point, last, last)]
+    db.remove_rows(conn, "sleep_sessions", gone)
+    written = conn.execute(
+        "SELECT 1 FROM sleep WHERE date = ? AND provider = ?", (night, google_sync.PROVIDER)
+    ).fetchone()
+    if written:
+        # Only the columns Google writes are withdrawn: an upsert leaves the
+        # rest, so the night can hold an imported efficiency beside them.
+        db.save_sleep(conn, {"date": night, **dict.fromkeys(_GOOGLE_SLEEP_COLUMNS)})
+    refreshed = _refresh(conn, data_type, first, last)
+    row = conn.execute("SELECT * FROM sleep WHERE date = ?", (night,)).fetchone()
+    if written and all(row[k] is None for k in row.keys() if k not in ("date", "provider")):
+        # A night left with no value at all is removed, as upstream's sweeps do.
+        db.remove_rows(conn, "sleep", [{"date": night}])
+        conn.commit()
+    return refreshed
+
+
+#: What upstream's nightly sleep sync writes: its sums, their span and count.
+_GOOGLE_SLEEP_COLUMNS = (
+    "total_minutes",
+    "sleep_period_minutes",
+    "deep_minutes",
+    "light_minutes",
+    "rem_minutes",
+    "wake_minutes",
+    "start_time",
+    "end_time",
+    "sessions",
+)
 
 
 def _refresh(conn, data_type, first, last) -> bool:

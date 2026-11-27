@@ -18,8 +18,7 @@ async def _log(data_type: str, build) -> str:
 
     def _run():
         payload, first, last = build(writes.account_zone())
-        point = writes.create(data_type, payload)
-        refreshed = writes.after_create(data_type, point, first.date(), last.date())
+        point, refreshed = writes.log(data_type, payload, first.date(), last.date())
         return {
             "logged": data_type,
             "data_point_id": point,
