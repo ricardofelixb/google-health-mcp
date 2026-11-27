@@ -304,7 +304,7 @@ This fork can also log to your account, so an agent can record what you tell it:
 1. On the Cloud console **Data Access** page, also tick `nutrition.writeonly`, `health_metrics_and_measurements.writeonly`, `activity_and_fitness.writeonly`, `sleep.writeonly`, `mindfulness.writeonly` and `logged_symptoms.writeonly`.
 2. Set `GOOGLE_HEALTH_MCP_WRITE=1` for both `auth` and the server, and run `google-health-mcp auth` again, ticking every permission. A grant does not gain scopes on refresh; `doctor` warns while any write scope is missing.
 
-The server then adds `health_log_food`, `health_log_water`, `health_log_weight`, `health_log_body_fat`, `health_log_exercise`, `health_log_sleep`, `health_log_mood`, `health_log_symptoms` and `health_delete_logged`. Times are local ISO datetimes in your account's time zone. Each log returns a `data_point_id`; pass it to `health_delete_logged` to undo a wrong entry. Offline mode refuses writes. Details: [docs/fork.md](docs/fork.md).
+The server then adds `health_log_food`, `health_log_water`, `health_log_weight`, `health_log_body_fat`, `health_log_exercise`, `health_log_sleep`, `health_log_mood`, `health_log_symptoms` and `health_delete_logged`. Times are local ISO datetimes in your account's time zone. Each log returns a `data_point_id`; pass it to `health_delete_logged` to undo a wrong entry. That tool deletes only points this server logged, which it records in the cache database. Offline mode refuses writes. Details: [docs/fork.md](docs/fork.md).
 
 ## Rate limits
 

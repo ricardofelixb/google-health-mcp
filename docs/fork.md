@@ -22,12 +22,27 @@ accepts as true), the server:
 Each create is `POST users/me/dataTypes/<type>/dataPoints` with the body Google's
 DataPoint reference documents for that type, and returns the new point's id (the
 last segment of the resource name; the full name carries the user id and is never
-returned). `health_delete_logged` sends `dataPoints:batchDelete` with that id.
+returned). Each created id is recorded, with the local days it covers, in a
+fork-only `fork_written_points` table in the cache database.
+`health_delete_logged` refuses any id not recorded there, since a point a tracker
+or the app wrote has a well-formed id too, and sends `dataPoints:batchDelete` for
+one that is. So a point logged before the cache was deleted can no longer be
+deleted from here, only in the app.
+
 Local ISO times without an offset are read in the account's time zone, from
-`users/me/settings` (`timeZone`, else `utcOffset`, else the host's). After a write
-the day or days written are re-synced through upstream's `run_sync`, so the read
-tools see the change at once. Moods and symptoms are write-only types: nothing
-reads them back, so nothing is cached for them.
+`users/me/settings` (`timeZone`, else `utcOffset`, else the host's). After a create
+or delete the account-local days it covers are re-fetched through upstream's
+normalisers (`GOOGLE_SYNC_HANDLERS`) on one connection, not through `run_sync`,
+which caps the range at the host's today and would drop the day of an account
+ahead of the host. That refresh is best-effort: a failure there reports
+`cache_refreshed: false` and never hides the id of a point already created.
+The hand-logged syncs remove what Google no longer holds, but the sleep syncs
+only upsert, so deleting a sleep session also removes its `sleep_sessions` row and
+the Google-written nightly `sleep` row through `db.remove_rows`, and the re-fetch
+rebuilds the night from the sessions left. A workout logged on a day an import
+recorded is reported `cache_refreshed: false`: upstream leaves such a day to the
+import, so it is in Google but not in the read tools. Moods and symptoms are
+write-only types: nothing reads them back, so nothing is cached for them.
 
 Writes use their own POST in `fork/writes.py` rather than `api.google_get`, because
 that one re-sends a request answered 500-503 and a re-sent create logs twice.
@@ -39,10 +54,10 @@ Errors follow AGENTS.md: fixed text, a status code and an operation such as
 | File | What |
 |---|---|
 | `src/google_health_mcp/fork/scopes.py` | scope list, `requested_scopes()`, the doctor check |
-| `src/google_health_mcp/fork/writes.py` | POST client, time handling, enums, create/delete, cache refresh |
+| `src/google_health_mcp/fork/writes.py` | POST client, time handling, enums, create/delete, ledger of created ids, cache refresh |
 | `src/google_health_mcp/fork/write_tools.py` | the MCP tools; registers them at import only when on |
 | `tests/test_fork_write_setting.py` | setting, consent scopes, doctor finding |
-| `tests/test_fork_writes.py` | each type's exact path and body, delete, refusals, error text, scope/writer parity, registration |
+| `tests/test_fork_writes.py` | each type's exact path and body, delete and its ownership check, cache refresh, refusals, error text, scope/writer parity, registration |
 
 **Hook lines in upstream files** (each marked `# fork` or `Fork`):
 
