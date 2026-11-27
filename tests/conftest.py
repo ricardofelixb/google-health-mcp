@@ -81,9 +81,11 @@ def _isolate_from_ambient_env(monkeypatch):
         "GOOGLE_HEALTH_MCP_OFFLINE",
         "GOOGLE_HEALTH_MCP_CONFIG_DIR",
         "GOOGLE_HEALTH_MCP_DB_PATH",
+        "GOOGLE_HEALTH_MCP_WRITE",  # fork: docs/fork.md
     ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(config, "OFFLINE_MODE", False)
+    monkeypatch.setattr(config, "WRITE_MODE", False)  # fork: docs/fork.md
 
 
 @pytest.fixture
