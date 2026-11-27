@@ -29,7 +29,10 @@ or the app wrote has a well-formed id too, and sends `dataPoints:batchDelete` fo
 one that is. So a point logged before the cache was deleted can no longer be
 deleted from here, only in the app. A log tool proves the table writable before it
 sends anything, and refuses when it is not, since a point it could not record
-could never be deleted here; the id is recorded on the same connection.
+could never be deleted here; the id is recorded on the same connection. If that
+record still fails once the point exists, the log returns its id with
+`deletable_here: false` and a note to delete it in the Fitbit app. Every log
+reports `deletable_here`.
 
 Local ISO times without an offset are read in the account's time zone, from
 `users/me/settings` (`timeZone`, else `utcOffset`, else the host's). After a create
@@ -40,18 +43,19 @@ ahead of the host. That refresh is best-effort: a failure there reports
 `cache_refreshed: false` and never hides the id of a point already created.
 The hand-logged syncs remove what Google no longer holds, but the sleep syncs
 only upsert, so deleting a sleep session also removes its `sleep_sessions` row
-through `db.remove_rows`. On the nightly `sleep` row, when Google wrote it last,
-only the columns upstream's sleep sync writes are withdrawn (`_GOOGLE_SLEEP_COLUMNS`,
-pinned against `sync_sleep` by a test), so an imported `efficiency` stays; the
-re-fetch rebuilds the sums from the sessions left, and a night left with no value
-is removed. Upstream leaves a day an import recorded to the import, so a workout
+through `db.remove_rows`. On the nightly `sleep` row a Google upsert leaves the
+columns it does not write that time, and `provider` names only the last writer, so
+before the delete the night is built from Google's answer by `sync_sleep` in an
+in-memory scratch cache, and only the columns holding exactly that value are
+withdrawn: an imported `efficiency` or `deep_minutes` beside them stays. The
+re-fetch then rebuilds the sums from the sessions left, and a night left with no
+value is removed. Upstream leaves a day an import recorded to the import, so a workout
 both hold is not stored twice. A workout this server just logged is in no import,
 so when the re-fetch skipped it, its day is normalised again by upstream's
 `sync_exercises` in an in-memory scratch cache holding no import and only that
 workout's row is copied across. A later sync keeps it, since Google holds it, and
 removes it once deleted; the day's other Google workouts stay the import's.
-Moods and symptoms are
-write-only types: nothing reads them back, so nothing is cached for them.
+Moods and symptoms are write-only types: nothing reads them back, so nothing is cached for them.
 
 Writes use their own POST in `fork/writes.py` rather than `api.google_get`, because
 that one re-sends a request answered 500-503 and a re-sent create logs twice.
