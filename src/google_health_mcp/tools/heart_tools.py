@@ -6,7 +6,7 @@ from typing import Literal
 import anyio
 
 from .. import db
-from ..errors import InvalidDateError
+from ..errors import InvalidDateError, LiveRefreshFailed
 from ..helpers import empty_answer, format_response, parse_date, require_auth
 from ..mcp_instance import mcp
 from .sync_tools import refresh_before_query
@@ -131,29 +131,50 @@ def _moment(text: str, name: str) -> tuple[datetime, date | None]:
     return (moment if moment.tzinfo else moment.astimezone()), None
 
 
-def _floor(moment: datetime, minutes: int) -> datetime:
-    """The start of the local-clock bucket `moment` falls in, on its own clock.
+def _offset(moment: datetime) -> timedelta | None:
+    return moment.astimezone().utcoffset()
 
-    The arithmetic stays at the offset `moment` was read at, so a reading is
-    bucketed by the clock that showed it: the hour a clock repeats when it
-    goes back stays two buckets, as does an hour a half-hour change cuts.
+
+def _change(before: datetime, after: datetime) -> datetime:
+    """The instant the host's offset changes between two instants, to the second.
+
+    `before` and `after` must be at different offsets, at most one change apart.
+    """
+    offset = _offset(before)
+    while after - before > timedelta(seconds=1):
+        middle = before + (after - before) / 2
+        if _offset(middle) == offset:
+            before = middle
+        else:
+            after = middle
+    return after.replace(microsecond=0)
+
+
+def _bucket(moment: datetime, minutes: int) -> tuple[datetime, datetime]:
+    """The local-clock bucket `moment` falls in, its end exclusive.
+
+    The bucket is laid out on the clock that showed `moment`, so the hour a
+    clock repeats when it goes back is two buckets. Where the clock changed
+    inside the bucket, it is cut at the change rather than starting or ending
+    at a time that clock never showed.
     """
     local = moment.astimezone()
-    return local - timedelta(
+    start = local - timedelta(
         minutes=(local.hour * 60 + local.minute) % minutes,
         seconds=local.second,
         microseconds=local.microsecond,
     )
-
-
-def _ceil(moment: datetime, minutes: int) -> datetime:
-    floor = _floor(moment, minutes)
-    return floor if floor == moment else floor + timedelta(minutes=minutes)
+    end = start + timedelta(minutes=minutes)
+    if _offset(start) != local.utcoffset():
+        start = _change(start, local)
+    if _offset(end - timedelta(seconds=1)) != local.utcoffset():
+        end = _change(local, end)
+    return start, end
 
 
 def _clock(moment: datetime) -> str:
     """A local time to the minute with its offset, unambiguous across a clock change."""
-    return moment.isoformat(timespec="minutes")
+    return moment.astimezone().isoformat(timespec="minutes")
 
 
 def _latest_sleep() -> tuple[str, str] | None:
@@ -198,7 +219,9 @@ def _intraday_window(start: str | None, end: str | None, minutes: int) -> tuple[
         raise InvalidDateError("end must be after start.")
     if last - first > timedelta(days=MAX_INTRADAY_DAYS):
         raise InvalidDateError(f"The window can be at most {MAX_INTRADAY_DAYS} days.")
-    return _floor(first, minutes), _ceil(last, minutes)
+    first = _bucket(first, minutes)[0]
+    start_of_last, end_of_last = _bucket(last, minutes)
+    return first, (last if start_of_last == last else end_of_last)
 
 
 def _bpm(heart: dict, key: str) -> float | None:
@@ -217,8 +240,9 @@ def _number(value: float) -> int | float:
 
 def _rebucket(days: list[dict], first: datetime, last: datetime, minutes: int) -> list[dict]:
     """The cached five-minute buckets inside [first, last), merged on the local clock."""
-    # Keyed by offset too: two clocks' buckets can start at the same instant.
-    merged: dict[tuple[datetime, timedelta | None], dict] = {}
+    # Keyed by the instant a bucket starts; a clock change cuts buckets
+    # rather than overlapping them, so no two start together.
+    merged: dict[datetime, dict] = {}
     for day in days:
         for point in day.get("points") or ():
             heart = point.get("heartRate") if isinstance(point, dict) else None
@@ -236,22 +260,21 @@ def _rebucket(days: list[dict], first: datetime, last: datetime, minutes: int) -
             )
             if low is None or mean is None or high is None:
                 continue
-            floor = _floor(moment, minutes)
             bucket = merged.setdefault(
-                (floor, floor.utcoffset()), {"floor": floor, "min": low, "means": [], "max": high}
+                _bucket(moment, minutes)[0], {"min": low, "means": [], "max": high}
             )
             bucket["min"] = min(bucket["min"], low)
             bucket["max"] = max(bucket["max"], high)
             bucket["means"].append(mean)
     return [
         {
-            "time": _clock(b["floor"]),
+            "time": _clock(start),
             "min": _number(b["min"]),
             "avg": round(sum(b["means"]) / len(b["means"]), 1),
             "max": _number(b["max"]),
             "_means": b["means"],
         }
-        for _, b in sorted(merged.items(), key=lambda item: item[0])
+        for start, b in sorted(merged.items())
     ]
 
 
@@ -283,7 +306,8 @@ async def health_get_heart_rate_intraday(
         live: If true, re-fetch these days from the API before reading the cache.
 
     Times are local, to the minute, with the UTC offset the clock showed, so
-    the hour a clock repeats when it goes back reads as two buckets. Returns start and end (the
+    the hour a clock repeats when it goes back reads as two buckets; a bucket
+    a clock change falls inside is cut at the change. Returns start and end (the
     window as widened), resolution_minutes, buckets (each with time, the start
     of the bucket, min and max bpm, and avg, the mean of its five-minute
     averages), and a summary with the window's min, avg and max and max_at,
@@ -293,9 +317,16 @@ async def health_get_heart_rate_intraday(
     if start is None and end is None:
         # The default window is read from the sessions, so bring them up to date.
         today = date.today()
-        await anyio.to_thread.run_sync(
-            lambda: refresh_before_query("sleep_sessions", today - timedelta(days=1), today, live)
-        )
+        try:
+            await anyio.to_thread.run_sync(
+                lambda: refresh_before_query(
+                    "sleep_sessions", today - timedelta(days=1), today, live
+                )
+            )
+        except LiveRefreshFailed:
+            # Best-effort: sleep only places the window, and without it the
+            # tool reads today. The heart rate's own refresh stays strict.
+            pass
     first, last = await anyio.to_thread.run_sync(
         lambda: _intraday_window(start, end, resolution_minutes)
     )

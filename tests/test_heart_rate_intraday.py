@@ -118,13 +118,15 @@ class TestTheSync:
         assert isinstance(raw, bytes)
 
 
-async def _call(db_path, **kwargs):
+async def _call(db_path, refresh_effect=None, **kwargs):
     from google_health_mcp.tools.heart_tools import health_get_heart_rate_intraday
 
     with (
         patch("google_health_mcp.helpers.GOOGLE_CLIENT_PATH") as client,
         patch("google_health_mcp.helpers.GOOGLE_TOKENS_PATH") as tokens,
-        patch("google_health_mcp.tools.heart_tools.refresh_before_query") as refresh,
+        patch(
+            "google_health_mcp.tools.heart_tools.refresh_before_query", side_effect=refresh_effect
+        ) as refresh,
         patch.object(db, "DB_PATH", db_path),
     ):
         client.exists.return_value = True
@@ -395,6 +397,18 @@ class TestTheDefaultWindow:
             True,
         )
 
+    async def test_a_sleep_refresh_that_fails_does_not_stop_the_heart_rate(self, tmp_db):
+        """Sleep only picks the default window; a grant without it still reads today."""
+        from google_health_mcp.errors import LiveRefreshFailed
+
+        def refresh(data_type, *args):
+            if data_type == "sleep_sessions":
+                raise LiveRefreshFailed("live refresh of sleep_sessions failed: skipped")
+
+        body, calls = await _call(_path(tmp_db), refresh_effect=refresh, live=True)
+        assert [c.args[0] for c in calls] == ["sleep_sessions", "heart_rate_intraday"]
+        assert body["message"] == "No intraday heart rate found for this period."
+
     async def test_a_window_asked_for_refreshes_no_sleep(self, tmp_db):
         _, calls = await _call(_path(tmp_db), start="2026-03-15")
         assert [c.args[0] for c in calls] == ["heart_rate_intraday"]
@@ -431,8 +445,39 @@ class TestAHalfHourClockChange:
             end=date(2026, 4, 5),
         )
         body, _ = await _call(_path(tmp_db), start="2026-04-05", resolution_minutes=60)
+        # The second hour starts when the clock went back, not at a 01:00 it never showed.
         assert [(b["time"], b["max"]) for b in body["buckets"]] == [
             ("2026-04-05T01:00+11:00", 70),
-            ("2026-04-05T01:00+10:30", 90),
+            ("2026-04-05T01:30+10:30", 90),
         ]
-        assert body["summary"]["max_at"] == "2026-04-05T01:00+10:30"
+        assert body["summary"]["max_at"] == "2026-04-05T01:30+10:30"
+
+    async def test_a_window_after_the_change_starts_at_it(self, tmp_db):
+        _sync(
+            tmp_db,
+            [_bucket("2026-04-04T14:40:00Z", high=70), _bucket("2026-04-04T15:00:00Z", high=90)],
+            start=date(2026, 4, 5),
+            end=date(2026, 4, 5),
+        )
+        body, _ = await _call(
+            _path(tmp_db),
+            start="2026-04-05T01:30+10:30",
+            end="2026-04-05T01:40+10:30",
+            resolution_minutes=60,
+        )
+        assert (body["start"], body["end"]) == ("2026-04-05T01:30+10:30", "2026-04-05T02:00+10:30")
+        assert [b["time"] for b in body["buckets"]] == ["2026-04-05T01:30+10:30"]
+
+    async def test_an_hour_the_clock_skips_into_is_cut_at_the_change(self, tmp_db):
+        # At 15:30 UTC the clock jumps from 02:00 +10:30 to 02:30 +11:00.
+        _sync(
+            tmp_db,
+            [_bucket("2026-10-03T15:20:00Z", high=70), _bucket("2026-10-03T15:40:00Z", high=90)],
+            start=date(2026, 10, 4),
+            end=date(2026, 10, 4),
+        )
+        body, _ = await _call(_path(tmp_db), start="2026-10-04", resolution_minutes=60)
+        assert [(b["time"], b["max"]) for b in body["buckets"]] == [
+            ("2026-10-04T01:00+10:30", 70),
+            ("2026-10-04T02:30+11:00", 90),
+        ]
