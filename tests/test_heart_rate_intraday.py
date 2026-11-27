@@ -223,8 +223,9 @@ class TestTheTool:
         assert body["start"] == "2026-03-15T23:00+01:00"
         assert body["end"] == "2026-03-16T07:00+01:00"
         assert [b["time"] for b in body["buckets"]] == ["2026-03-15T23:00+01:00"]
-        assert {c.args[0] for c in calls} == {"heart_rate_intraday"}
-        assert {(c.args[1], c.args[2]) for c in calls} == {(date(2026, 3, 15), date(2026, 3, 16))}
+        # The sessions are brought up to date first, since the default reads them.
+        assert [c.args[0] for c in calls] == ["sleep_sessions", "heart_rate_intraday"]
+        assert (calls[1].args[1], calls[1].args[2]) == (date(2026, 3, 15), date(2026, 3, 16))
 
     async def test_live_reaches_the_refresh(self, tmp_db):
         _, calls = await _call(_path(tmp_db), start="2026-03-15", live=True)
@@ -370,6 +371,34 @@ class TestTheDefaultWindow:
         assert (body["start"], body["end"]) == ("2026-03-15T23:00+01:00", "2026-03-16T07:00+01:00")
         assert [b["time"] for b in body["buckets"]] == ["2026-03-16T00:00+01:00"]
 
+    def test_a_night_of_several_sessions_without_them_is_not_one_window(self, tmp_db):
+        """Its span holds the hours awake between them, so the default is a day instead."""
+        db.save_sleep(
+            tmp_db,
+            {
+                "date": "2026-03-16",
+                "start_time": "2026-03-15T22:00:00Z",
+                "end_time": "2026-03-16T14:00:00Z",
+                "sessions": 2,
+            },
+        )
+        tmp_db.commit()
+        assert db.latest_sleep_window(tmp_db) is None
+
+    async def test_without_a_window_the_sessions_are_refreshed_first(self, tmp_db):
+        _, calls = await _call(_path(tmp_db), live=True)
+        today = date.today()
+        assert (calls[0].args[0], calls[0].args[1], calls[0].args[2], calls[0].args[3]) == (
+            "sleep_sessions",
+            today - timedelta(days=1),
+            today,
+            True,
+        )
+
+    async def test_a_window_asked_for_refreshes_no_sleep(self, tmp_db):
+        _, calls = await _call(_path(tmp_db), start="2026-03-15")
+        assert [c.args[0] for c in calls] == ["heart_rate_intraday"]
+
     def test_a_newer_night_without_sessions_is_still_preferred(self, tmp_db):
         self._session(tmp_db, "fictional/old", "2026-03-15T22:00:00Z", "2026-03-16T06:00:00Z")
         db.save_sleep(
@@ -382,3 +411,28 @@ class TestTheDefaultWindow:
         )
         tmp_db.commit()
         assert db.latest_sleep_window(tmp_db) == ("2026-03-16T22:00:00Z", "2026-03-17T06:00:00Z")
+
+
+@pytest.fixture
+def _lord_howe(monkeypatch):
+    """A host whose clocks go back half an hour, so an hour's bucket can straddle two offsets."""
+    monkeypatch.setenv("TZ", "Australia/Lord_Howe")
+    time.tzset()
+
+
+@pytest.mark.usefixtures("_lord_howe")
+class TestAHalfHourClockChange:
+    async def test_each_reading_is_bucketed_on_its_own_clock(self, tmp_db):
+        # 14:40 UTC is 01:40 at +11:00; at 15:00 UTC the clock goes back to 01:30, +10:30.
+        _sync(
+            tmp_db,
+            [_bucket("2026-04-04T14:40:00Z", high=70), _bucket("2026-04-04T15:00:00Z", high=90)],
+            start=date(2026, 4, 5),
+            end=date(2026, 4, 5),
+        )
+        body, _ = await _call(_path(tmp_db), start="2026-04-05", resolution_minutes=60)
+        assert [(b["time"], b["max"]) for b in body["buckets"]] == [
+            ("2026-04-05T01:00+11:00", 70),
+            ("2026-04-05T01:00+10:30", 90),
+        ]
+        assert body["summary"]["max_at"] == "2026-04-05T01:00+10:30"

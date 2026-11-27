@@ -1186,11 +1186,12 @@ def latest_sleep_window(conn: sqlite3.Connection) -> tuple[str, str] | None:
     The longest session dated that night, since the nightly `sleep` row spans
     every session sharing its date - a night and an afternoon nap read as one
     span with the hours awake between them. The nightly row stands in only
-    when no session is held for the latest night, as on an imported history.
+    when no session is held for the latest night and the row is one session,
+    as on an imported history; otherwise there is no window, not that span.
     """
     held = " WHERE start_time IS NOT NULL AND end_time IS NOT NULL"
     night = conn.execute(
-        "SELECT date, start_time, end_time FROM sleep"
+        "SELECT date, start_time, end_time, sessions FROM sleep"
         + held
         + " ORDER BY date DESC, start_time DESC LIMIT 1"
     ).fetchone()
@@ -1203,7 +1204,9 @@ def latest_sleep_window(conn: sqlite3.Connection) -> tuple[str, str] | None:
     ).fetchone()
     if session is not None and (night is None or session[0] >= night[0]):
         return session[1], session[2]
-    return (night[1], night[2]) if night else None
+    if night is None or (night[3] or 1) > 1:
+        return None
+    return night[1], night[2]
 
 
 def query_sleep_sessions(conn: sqlite3.Connection, start_date: str, end_date: str) -> list[dict]:

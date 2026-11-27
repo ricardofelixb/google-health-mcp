@@ -132,10 +132,11 @@ def _moment(text: str, name: str) -> tuple[datetime, date | None]:
 
 
 def _floor(moment: datetime, minutes: int) -> datetime:
-    """The start of the local-clock bucket `moment` falls in, at its own offset.
+    """The start of the local-clock bucket `moment` falls in, on its own clock.
 
-    The offset is kept so the hour a clock repeats when it goes back stays two
-    hours rather than one.
+    The arithmetic stays at the offset `moment` was read at, so a reading is
+    bucketed by the clock that showed it: the hour a clock repeats when it
+    goes back stays two buckets, as does an hour a half-hour change cuts.
     """
     local = moment.astimezone()
     return local - timedelta(
@@ -152,7 +153,7 @@ def _ceil(moment: datetime, minutes: int) -> datetime:
 
 def _clock(moment: datetime) -> str:
     """A local time to the minute with its offset, unambiguous across a clock change."""
-    return moment.astimezone().isoformat(timespec="minutes")
+    return moment.isoformat(timespec="minutes")
 
 
 def _latest_sleep() -> tuple[str, str] | None:
@@ -216,7 +217,8 @@ def _number(value: float) -> int | float:
 
 def _rebucket(days: list[dict], first: datetime, last: datetime, minutes: int) -> list[dict]:
     """The cached five-minute buckets inside [first, last), merged on the local clock."""
-    merged: dict[datetime, dict] = {}
+    # Keyed by offset too: two clocks' buckets can start at the same instant.
+    merged: dict[tuple[datetime, timedelta | None], dict] = {}
     for day in days:
         for point in day.get("points") or ():
             heart = point.get("heartRate") if isinstance(point, dict) else None
@@ -234,21 +236,22 @@ def _rebucket(days: list[dict], first: datetime, last: datetime, minutes: int) -
             )
             if low is None or mean is None or high is None:
                 continue
+            floor = _floor(moment, minutes)
             bucket = merged.setdefault(
-                _floor(moment, minutes), {"min": low, "means": [], "max": high}
+                (floor, floor.utcoffset()), {"floor": floor, "min": low, "means": [], "max": high}
             )
             bucket["min"] = min(bucket["min"], low)
             bucket["max"] = max(bucket["max"], high)
             bucket["means"].append(mean)
     return [
         {
-            "time": _clock(moment),
+            "time": _clock(b["floor"]),
             "min": _number(b["min"]),
             "avg": round(sum(b["means"]) / len(b["means"]), 1),
             "max": _number(b["max"]),
             "_means": b["means"],
         }
-        for moment, b in sorted(merged.items())
+        for _, b in sorted(merged.items(), key=lambda item: item[0])
     ]
 
 
@@ -270,7 +273,8 @@ async def health_get_heart_rate_intraday(
     Args:
         start: "YYYY-MM-DD" (local midnight), "YYYY-MM-DDTHH:MM" (local time),
             or a time with an offset or Z. Default: the longest sleep session
-            of the latest night held in the cache, or today if none is.
+            of the latest night, its sessions auto-synced if stale, or today
+            if none is held.
         end: Same forms, exclusive; a date alone means the end of that day.
             Default: a day after start. At most 7 days after start. Both ends
             are widened to whole buckets, and the reply says where they fell.
@@ -278,14 +282,20 @@ async def health_get_heart_rate_intraday(
             30 or 60. Default: 15.
         live: If true, re-fetch these days from the API before reading the cache.
 
-    Times are local, to the minute, with their UTC offset, so the hour a clock
-    repeats when it goes back reads as two hours. Returns start and end (the
+    Times are local, to the minute, with the UTC offset the clock showed, so
+    the hour a clock repeats when it goes back reads as two buckets. Returns start and end (the
     window as widened), resolution_minutes, buckets (each with time, the start
     of the bucket, min and max bpm, and avg, the mean of its five-minute
     averages), and a summary with the window's min, avg and max and max_at,
     the bucket the highest reading fell in. Buckets with nothing worn are left
     out.
     """
+    if start is None and end is None:
+        # The default window is read from the sessions, so bring them up to date.
+        today = date.today()
+        await anyio.to_thread.run_sync(
+            lambda: refresh_before_query("sleep_sessions", today - timedelta(days=1), today, live)
+        )
     first, last = await anyio.to_thread.run_sync(
         lambda: _intraday_window(start, end, resolution_minutes)
     )
